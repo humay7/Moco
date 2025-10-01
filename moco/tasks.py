@@ -372,3 +372,61 @@ def train_task(cfg, key, num_steps, optimizer, task_family):
     best_rewards = jax.lax.associative_scan(jax.numpy.minimum, results['best_reward']) # equivalent to np.minimum.accumulate()which is not yet implemented in jax https://github.com/google/jax/issues/11281
     results.best_reward = best_rewards
     return results
+
+# @chex.assert_max_traces(n=1)
+@partial(jax.jit, static_argnames=['num_steps', 'optimizer', 'task_family'])
+def train_task_with_trajectory(cfg, key, num_steps, optimizer, task_family):
+    """ Train a task for num_steps using the optimizer and return the full trajectory for DDPG.
+    Args:
+        optimizer_params: parameters of the optimizer
+        cfg: task configuration
+        key: random key
+        num_steps: number of training steps
+        optimizer: optimizer
+        task_family: task family
+    Returns:
+        trajectory: dict containing states, actions, rewards, and metrics at each step
+    """
+
+    task = task_family.task_fn(cfg)
+    key, params_key, rollout_key = jax.random.split(key, 3)
+    params, model_state = task.init_with_state(params_key)
+
+    opt_stattre = optimizer.init(params, model_state, num_steps=num_steps)
+
+    def loss_fn(param, model_state, key, data):
+        """Wrapper around loss_with_state_and_aux to return 2 values."""
+        loss, model_state, aux, metrics = task.loss_with_state_and_aux(param, model_state, key, data, with_metrics=True)
+        return loss, (model_state, aux, metrics)
+        
+    def step_fn(state, key):
+        opt_state, model_state = state
+        params = optimizer.get_params(opt_state)
+        grad_fun = jax.value_and_grad(loss_fn, has_aux=True)
+        (loss, (model_state, aux, metrics)), grad = grad_fun(params, model_state, key, None)
+        opt_state = optimizer.update(opt_state, grad, loss, model_state)
+        
+        # Return additional information for DDPG
+        step_info = {
+            'state': model_state.graph,  # Direct graph state for DDPG
+            'action': params['params']['heatmap'],      # Current heatmap (actor output)
+            'reward': metrics.best_reward,  # Best reward at this step
+            'metrics': metrics,    # All metrics
+            'aux': aux,           # Auxiliary information
+            'opt_state': opt_state  # Optimizer state (for debugging)
+        }
+        
+        return (opt_state, model_state), step_info
+
+    def run_n_step(opt_state, model_state, key, n):
+        random_keys = jax.random.split(key, n)
+        (opt_state, model_state), trajectory = jax.lax.scan(step_fn, (opt_state, model_state), random_keys)
+        return trajectory
+
+    trajectory = run_n_step(opt_state, model_state, rollout_key, num_steps)
+
+    # Compute cumulative best rewards
+    best_rewards = jax.lax.associative_scan(jax.numpy.minimum, trajectory['reward'])
+    trajectory['best_reward'] = best_rewards
+    
+    return trajectory

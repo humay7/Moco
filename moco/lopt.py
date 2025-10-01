@@ -80,22 +80,6 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
         )
       return network(graph)
     
-    def init_forward(graph):
-      network = GNN(
-        num_layers = self.num_layers_init, 
-        embedding_size= self.embedding_size,
-        aggregation = self.aggregation,
-        embed_globals=False,
-        update_globals = False, 
-        decode_globals = False ,
-        decode_edges = True, 
-        decode_edge_dimension = 1, 
-        decode_global_dimension = 1,
-        normalization=self.normalization
-        )
-      return network(graph)
-
-    self.init_net = hk.without_apply_rng(hk.transform(init_forward))
     self.update_net = hk.without_apply_rng(hk.transform(update_forward))
 
   def init(self, key) -> MetaParams:
@@ -131,20 +115,7 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
         n_edge= jnp.array([num_edges])
     )
 
-    dummy_graph_init = GraphsTuple(
-        nodes= jnp.zeros((num_nodes, 1)),
-        globals = None,
-        senders= senders,
-        receivers= receivers, 
-        edges= jnp.zeros((num_edges, 1)),
-        n_node= jnp.array([num_nodes]),
-        n_edge= jnp.array([num_edges])
-    )
-
-    params = {
-      'init_params': self.init_net.init(key, dummy_graph_init),
-      'update_params': self.update_net.init(key, dummy_graph_update)
-    }
+    params = self.update_net.init(key, dummy_graph_update)
     return params
 
   def opt_fn(self, theta: MetaParams, is_training: bool = False) -> opt_base.Optimizer:
@@ -152,7 +123,6 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
     # this captures over the meta-parameters, theta.
     decays = jnp.asarray([0.1, 0.5, 0.9, 0.99, 0.999, 0.9999])
     normalize = self.normalize_inputs
-    init_net = self.init_net
     update_net = self.update_net
     compute_summary = self._compute_summary
     update_strategy = self.update_strategy
@@ -167,13 +137,44 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
         """Initialize inner opt state."""
         n,k = params['params']['heatmap'].shape
 
-        # initialize the heatmap from model
-        graph = model_state.graph._replace(
-          edges = model_state.graph.edges['distances'],
-          globals = None,
-          nodes = model_state.graph.nodes['initial_pos'])
-
-        output = init_net.apply(theta['init_params'], graph)
+        # initialize the heatmap from model using update network with zero-padded features
+        # Create graph with same structure as update network but with zero-padded additional features
+        
+        # Get original features
+        node_feats = [v for k,v in model_state.graph.nodes.items()]
+        edge_feats = [v for k,v in model_state.graph.edges.items()]
+        
+        # Add zero-padded additional features for initial state
+        n_edges = n * k  # Number of edges (n nodes, k neighbors each)
+        zero_momentum = jnp.zeros((n_edges, 1))  # +1 feature
+        zero_grad = jnp.zeros((n_edges, 1))       # +1 feature  
+        zero_params = jnp.zeros((n_edges, 6))     # +6 features
+        
+        additional_inp = [zero_momentum, zero_grad, zero_params]
+        stacked_inp = jnp.concatenate(additional_inp, axis=-1)
+        edge_feats.append(stacked_inp)
+        
+        # Add zero-padded training step and budget features for initial state
+        global_feats = [v for k,v in model_state.graph.globals.items()]
+        zero_training_step = jnp.zeros((1, 11))  # +11 features
+        zero_budget = jnp.zeros((1, 1))          # +1 feature
+        
+        # Stack all features
+        stacked_global = jnp.concatenate(global_feats, axis=-1)
+        stacked_global = jnp.concatenate([stacked_global, zero_training_step, zero_budget], axis=-1)
+        stacked_node = jnp.concatenate(node_feats, axis=-1)
+        stacked_edge = jnp.concatenate(edge_feats, axis=-1)
+        
+        graph = GraphsTuple(
+            nodes=stacked_node,
+            edges=stacked_edge,
+            globals=stacked_global,
+            senders=model_state.graph.senders,
+            receivers=model_state.graph.receivers,
+            n_node=model_state.graph.n_node,
+            n_edge=model_state.graph.n_edge
+        )
+        output = update_net.apply(theta, graph)
 
         params = flax.core.unfreeze(params)
         # params['params']['heatmap'] = graph.edges.reshape(n,k)
@@ -242,7 +243,7 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
         )
 
         # apply GNN
-        output = update_net.apply(theta['update_params'], graph)
+        output = update_net.apply(theta, graph)
 
         if update_strategy == 'direct':
           new_p = output.edges.reshape(n,k)
@@ -288,21 +289,6 @@ class MisOptimizer(lopt_base.LearnedOptimizer):
         )
       return network(graph)
     
-    def init_forward(graph):
-      network = GCN(
-        num_layers = self.num_layers_update, 
-        embedding_size = self.embedding_size,
-        aggregation = self.aggregation,
-        embed_globals = False,
-        update_globals = False, 
-        decode_globals = False,
-        decode_node_dimension = 1, 
-        decode_global_dimension = 1,
-        # normalization = self.normalization
-        )
-      return network(graph)
-
-    self.init_net = hk.without_apply_rng(hk.transform(init_forward))
     self.update_net = hk.without_apply_rng(hk.transform(update_forward))
 
   def init(self, key) -> MetaParams:
@@ -333,27 +319,13 @@ class MisOptimizer(lopt_base.LearnedOptimizer):
         n_edge = jnp.array([num_edges])
     )
 
-    dummy_graph_init = GraphsTuple(
-        nodes= jnp.zeros((num_nodes, 1)),
-        globals = None,
-        senders= senders,
-        receivers= receivers, 
-        edges= None,
-        n_node= jnp.array([num_nodes]),
-        n_edge= jnp.array([num_edges])
-    )
-
-    params = {
-      'init_params': self.init_net.init(key, dummy_graph_init),
-      'update_params': self.update_net.init(key, dummy_graph_update)
-    }
+    params = self.update_net.init(key, dummy_graph_update)
     return params
 
   def opt_fn(self, theta: MetaParams, is_training: bool = False) -> opt_base.Optimizer:
     # define an anonymous class which implements the optimizer.
     # this captures over the meta-parameters, theta.
     decays = jnp.asarray([0.1, 0.5, 0.9, 0.99, 0.999, 0.9999])
-    init_net = self.init_net
     update_net = self.update_net
 
     class _Opt(opt_base.Optimizer):
@@ -364,13 +336,30 @@ class MisOptimizer(lopt_base.LearnedOptimizer):
                key: Optional[PRNGKey] = None) -> GNNLOptState:
         """Initialize inner opt state."""
 
-        # initialize the heatmap from model
+        # initialize the heatmap from model using update network
+        # Create graph with proper structure for update network
+        node_feats = [v for k,v in model_state.graph.nodes.items()]
+        global_feats = [v for k,v in model_state.graph.globals.items()]
+        
+        # Add zero-padded additional features for initial state
+        zero_training_step = jnp.zeros((1, 11))  # +11 features
+        zero_budget = jnp.zeros((1, 1))          # +1 feature
+        zero_momentum = jnp.zeros((model_state.graph.n_node[0], 1))  # +1 feature
+        zero_grad = jnp.zeros((model_state.graph.n_node[0], 1))       # +1 feature  
+        zero_params = jnp.zeros((model_state.graph.n_node[0], 1))     # +1 feature
+        
+        # Stack all features
+        stacked_global = jnp.concatenate(global_feats, axis=-1)
+        stacked_global = jnp.concatenate([stacked_global, zero_training_step, zero_budget], axis=-1)
+        stacked_node = jnp.concatenate(node_feats, axis=-1)
+        stacked_node = jnp.concatenate([stacked_node, zero_momentum, zero_grad, zero_params], axis=-1)
+        
         graph = model_state.graph._replace(
-          edges = None,
-          globals = None,
-          nodes = model_state.graph.nodes['dummy'])
+            nodes=stacked_node,
+            globals=stacked_global,
+        )
 
-        output = init_net.apply(theta['init_params'], graph)
+        output = update_net.apply(theta, graph)
 
         params = flax.core.unfreeze(params)
         params['params']['heatmap'] = output.nodes.squeeze()
@@ -420,7 +409,7 @@ class MisOptimizer(lopt_base.LearnedOptimizer):
         )
 
         # apply GNN
-        output = update_net.apply(theta['update_params'], graph)
+        output = update_net.apply(theta, graph)
         temp = 0.5*(jax.nn.tanh(output.globals)+1)[0] # temperature between 0 and 1
         new_p = (output.nodes / temp).squeeze()
 

@@ -241,20 +241,51 @@ class DDPGAgent:
     
     def _get_actions(self, actor_params: Any, states: Any) -> Any:
         """Get actions from actor networks"""
-        # Use the update network to generate actions (heatmaps); return edge outputs
-        output = self.update_net.apply(actor_params, states)
-        return output.edges
+        # Handle batched states (E, T, ...) by processing each timestep separately
+        if states.nodes.ndim == 3:  # (E, T, num_nodes, features)
+            # Process each timestep separately
+            def process_timestep(t):
+                states_t = jax.tree_map(lambda x: x[:, t], states)
+                output = self.update_net.apply(actor_params, states_t)
+                return output.edges
+            
+            # Process all timesteps
+            actions = jax.vmap(process_timestep)(jnp.arange(states.nodes.shape[1]))
+            return actions
+        else:
+            # Single timestep case
+            output = self.update_net.apply(actor_params, states)
+            return output.edges
     
     def _concatenate_action_to_state(self, states: Any, actions: Any) -> Any:
         """Concatenate action (heatmap) to edge features of the graph state"""
         
-        # Concatenate action to edge features
-        new_edge_features = jnp.concatenate([states.edges, actions], axis=-1)
-        
-        # Create new GraphsTuple with updated edge features
-        new_state = states._replace(edges=new_edge_features)
-        
-        return new_state
+        # Handle batched states (E, T, ...) by processing each timestep separately
+        if states.nodes.ndim == 3:  # (E, T, num_nodes, features)
+            # Process each timestep separately
+            def process_timestep(t):
+                states_t = jax.tree_map(lambda x: x[:, t], states)
+                actions_t = actions[:, t] if actions.ndim > 1 else actions
+                
+                # Concatenate action to edge features
+                new_edge_features = jnp.concatenate([states_t.edges, actions_t], axis=-1)
+                
+                # Create new GraphsTuple with updated edge features
+                new_state_t = states_t._replace(edges=new_edge_features)
+                return new_state_t
+            
+            # Process all timesteps
+            new_states = jax.vmap(process_timestep)(jnp.arange(states.nodes.shape[1]))
+            return new_states
+        else:
+            # Single timestep case
+            # Concatenate action to edge features
+            new_edge_features = jnp.concatenate([states.edges, actions], axis=-1)
+            
+            # Create new GraphsTuple with updated edge features
+            new_state = states._replace(edges=new_edge_features)
+            
+            return new_state
     
     def update(self, state: DDPGState, batch: Any) -> Tuple[DDPGState, Any]:
         """Update DDPG agent using separate critic and actor updates"""

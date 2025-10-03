@@ -392,7 +392,7 @@ def train_task_with_trajectory(cfg, key, num_steps, optimizer, task_family):
     key, params_key, rollout_key = jax.random.split(key, 3)
     params, model_state = task.init_with_state(params_key)
 
-    opt_stattre = optimizer.init(params, model_state, num_steps=num_steps)
+    opt_state = optimizer.init(params, model_state, num_steps=num_steps)
 
     def loss_fn(param, model_state, key, data):
         """Wrapper around loss_with_state_and_aux to return 2 values."""

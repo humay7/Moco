@@ -404,18 +404,31 @@ def train_task_with_trajectory(cfg, key, num_steps, optimizer, task_family):
         params = optimizer.get_params(opt_state)
         grad_fun = jax.value_and_grad(loss_fn, has_aux=True)
         (loss, (model_state, aux, metrics)), grad = grad_fun(params, model_state, key, None)
+
+        # Capture pre-update state and action to ensure t=0 emission uses init graph/heatmap
+        pre_update_graph = opt_state.augmented_graph
+        pre_update_action = params['params']['heatmap']
+
+        # Update optimizer (which stores the augmented graph for the next state)
         opt_state = optimizer.update(opt_state, grad, loss, model_state)
-        
+
+        # Build aligned RL tuple (s_t, a_t, r_t, s_{t+1})
+        state_graph = pre_update_graph
+        next_state_graph = opt_state.augmented_graph
+        action = pre_update_action
+
         # Return additional information for DDPG
         step_info = {
-            'state': model_state.graph,  # Direct graph state for DDPG
-            'action': params['params']['heatmap'],      # Current heatmap (actor output)
-            'reward': metrics.best_reward,  # Best reward at this step
-            'metrics': metrics,    # All metrics
-            'aux': aux,           # Auxiliary information
-            'opt_state': opt_state  # Optimizer state (for debugging)
+            'state': state_graph,
+            'next_state': next_state_graph,
+            'action': action,  # pre-update action a_t
+            'next_action': opt_state.params['params']['heatmap'],  # post-update action a_{t+1}
+            'reward': metrics.best_reward,
+            'metrics': metrics,
+            'aux': aux,
+            'opt_state': opt_state
         }
-        
+
         return (opt_state, model_state), step_info
 
     def run_n_step(opt_state, model_state, key, n):

@@ -46,6 +46,7 @@ class GNNLOptState:
   state: Any # model state, required by learned optimization interface
   iteration: jnp.ndarray
   budget: jnp.ndarray
+  augmented_graph: Any = None  # Store the augmented graph with optimizer features
 
 import haiku as hk
 
@@ -115,7 +116,9 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
         n_edge= jnp.array([num_edges])
     )
 
-    params = self.update_net.init(key, dummy_graph_update)
+    params = {
+      'update_params': self.update_net.init(key, dummy_graph_update)
+    }
     return params
 
   def opt_fn(self, theta: MetaParams, is_training: bool = False) -> opt_base.Optimizer:
@@ -137,48 +140,40 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
         """Initialize inner opt state."""
         n,k = params['params']['heatmap'].shape
 
-        # initialize the heatmap from model using update network with zero-padded features
-        # Create graph with same structure as update network but with zero-padded additional features
-        
-        # Get original features
-        node_feats = [v for k,v in model_state.graph.nodes.items()]
-        edge_feats = [v for k,v in model_state.graph.edges.items()]
-        
-        # Add zero-padded additional features for initial state
-        n_edges = n * k  # Number of edges (n nodes, k neighbors each)
-        zero_momentum = jnp.zeros((n_edges, 1))  # +1 feature
-        zero_grad = jnp.zeros((n_edges, 1))       # +1 feature  
-        zero_params = jnp.zeros((n_edges, 6))     # +6 features
-        
-        additional_inp = [zero_momentum, zero_grad, zero_params]
-        stacked_inp = jnp.concatenate(additional_inp, axis=-1)
-        edge_feats.append(stacked_inp)
-        
-        # Add zero-padded training step and budget features for initial state
-        global_feats = [v for k,v in model_state.graph.globals.items()]
-        zero_training_step = jnp.zeros((1, 11))  # +11 features
-        zero_budget = jnp.zeros((1, 1))          # +1 feature
-        
-        # Stack all features
-        stacked_global = jnp.concatenate(global_feats, axis=-1)
-        stacked_global = jnp.concatenate([stacked_global, zero_training_step, zero_budget], axis=-1)
-        stacked_node = jnp.concatenate(node_feats, axis=-1)
-        stacked_edge = jnp.concatenate(edge_feats, axis=-1)
-        
-        graph = GraphsTuple(
-            nodes=stacked_node,
-            edges=stacked_edge,
-            globals=stacked_global,
-            senders=model_state.graph.senders,
-            receivers=model_state.graph.receivers,
-            n_node=model_state.graph.n_node,
-            n_edge=model_state.graph.n_edge
-        )
-        output = update_net.apply(theta, graph)
+        # Build an initial augmented graph with consistent structure/types used in updates
+        # Edge optimizer features: zeros for momentum(6), grad(1), params(1) at t=0
+        e = n * k
+        momentum0 = jnp.zeros((e, 6))
+        grad0 = jnp.zeros((e, 1))
+        param_feat0 = jnp.zeros((e, 1))
+        stacked_inp0 = jnp.concatenate([momentum0, grad0, param_feat0], axis=-1)  # (e,8)
 
+        edge_feats0 = [v for _, v in model_state.graph.edges.items()]
+        stacked_edge0 = jnp.concatenate(edge_feats0 + [stacked_inp0], axis=-1)
+
+        node_feats0 = [v for _, v in model_state.graph.nodes.items()]
+        stacked_node0 = jnp.concatenate(node_feats0, axis=-1)
+
+        global_feats0 = [v for _, v in model_state.graph.globals.items()]
+        training_step_feature0 = _tanh_embedding(jnp.asarray(0, dtype=jnp.int32)).reshape(1, -1)
+        budget0 = jnp.asarray(num_steps if num_steps is not None else 1, dtype=jnp.int32)
+        budget_feature0 = (jnp.asarray(0, dtype=jnp.int32) / budget0).reshape(1, 1)
+        stacked_global0 = jnp.concatenate(global_feats0 + [training_step_feature0, budget_feature0], axis=-1)
+
+        augmented_graph0 = GraphsTuple(
+          nodes=stacked_node0,
+          edges=stacked_edge0,
+          globals=stacked_global0,
+          senders=model_state.graph.senders,
+          receivers=model_state.graph.receivers,
+          n_node=model_state.graph.n_node,
+          n_edge=model_state.graph.n_edge,
+        )
+
+        # Initialize heatmap by running update_net on t=0 augmented graph
+        output0 = update_net.apply(theta['update_params'], augmented_graph0)
         params = flax.core.unfreeze(params)
-        # params['params']['heatmap'] = graph.edges.reshape(n,k)
-        params['params']['heatmap'] = output.edges.reshape(n,k)
+        params['params']['heatmap'] = output0.edges.reshape(n, k)
         params = flax.core.freeze(params)
 
         return GNNLOptState(
@@ -187,6 +182,7 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
             rolling_features=common.vec_rolling_mom(decays).init(params),
             iteration=jnp.asarray(0, dtype=jnp.int32),
             budget=jnp.asarray(num_steps, dtype=jnp.int32),
+            augmented_graph=augmented_graph0
         )
       def update(
           self,  # pytype: disable=signature-mismatch  # overriding-parameter-count-checks
@@ -243,7 +239,7 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
         )
 
         # apply GNN
-        output = update_net.apply(theta, graph)
+        output = update_net.apply(theta['update_params'], graph)
 
         if update_strategy == 'direct':
           new_p = output.edges.reshape(n,k)
@@ -258,6 +254,7 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
           rolling_features=tree_utils.match_type(next_rolling_features, opt_state.rolling_features),
           iteration=opt_state.iteration + 1,
           budget=opt_state.budget,
+          augmented_graph=graph  # Store the augmented graph
         )
         return new_opt_state
     return _Opt()
@@ -289,6 +286,21 @@ class MisOptimizer(lopt_base.LearnedOptimizer):
         )
       return network(graph)
     
+    def init_forward(graph):
+      network = GCN(
+        num_layers = self.num_layers_update, 
+        embedding_size = self.embedding_size,
+        aggregation = self.aggregation,
+        embed_globals = False,
+        update_globals = False, 
+        decode_globals = False,
+        decode_node_dimension = 1, 
+        decode_global_dimension = 1,
+        # normalization = self.normalization
+        )
+      return network(graph)
+
+    self.init_net = hk.without_apply_rng(hk.transform(init_forward))
     self.update_net = hk.without_apply_rng(hk.transform(update_forward))
 
   def init(self, key) -> MetaParams:
@@ -319,13 +331,27 @@ class MisOptimizer(lopt_base.LearnedOptimizer):
         n_edge = jnp.array([num_edges])
     )
 
-    params = self.update_net.init(key, dummy_graph_update)
+    dummy_graph_init = GraphsTuple(
+        nodes= jnp.zeros((num_nodes, 1)),
+        globals = None,
+        senders= senders,
+        receivers= receivers, 
+        edges= None,
+        n_node= jnp.array([num_nodes]),
+        n_edge= jnp.array([num_edges])
+    )
+
+    params = {
+      'init_params': self.init_net.init(key, dummy_graph_init),
+      'update_params': self.update_net.init(key, dummy_graph_update)
+    }
     return params
 
   def opt_fn(self, theta: MetaParams, is_training: bool = False) -> opt_base.Optimizer:
     # define an anonymous class which implements the optimizer.
     # this captures over the meta-parameters, theta.
     decays = jnp.asarray([0.1, 0.5, 0.9, 0.99, 0.999, 0.9999])
+    init_net = self.init_net
     update_net = self.update_net
 
     class _Opt(opt_base.Optimizer):
@@ -336,30 +362,13 @@ class MisOptimizer(lopt_base.LearnedOptimizer):
                key: Optional[PRNGKey] = None) -> GNNLOptState:
         """Initialize inner opt state."""
 
-        # initialize the heatmap from model using update network
-        # Create graph with proper structure for update network
-        node_feats = [v for k,v in model_state.graph.nodes.items()]
-        global_feats = [v for k,v in model_state.graph.globals.items()]
-        
-        # Add zero-padded additional features for initial state
-        zero_training_step = jnp.zeros((1, 11))  # +11 features
-        zero_budget = jnp.zeros((1, 1))          # +1 feature
-        zero_momentum = jnp.zeros((model_state.graph.n_node[0], 1))  # +1 feature
-        zero_grad = jnp.zeros((model_state.graph.n_node[0], 1))       # +1 feature  
-        zero_params = jnp.zeros((model_state.graph.n_node[0], 1))     # +1 feature
-        
-        # Stack all features
-        stacked_global = jnp.concatenate(global_feats, axis=-1)
-        stacked_global = jnp.concatenate([stacked_global, zero_training_step, zero_budget], axis=-1)
-        stacked_node = jnp.concatenate(node_feats, axis=-1)
-        stacked_node = jnp.concatenate([stacked_node, zero_momentum, zero_grad, zero_params], axis=-1)
-        
+        # initialize the heatmap from model
         graph = model_state.graph._replace(
-            nodes=stacked_node,
-            globals=stacked_global,
-        )
+          edges = None,
+          globals = None,
+          nodes = model_state.graph.nodes['dummy'])
 
-        output = update_net.apply(theta, graph)
+        output = init_net.apply(theta['init_params'], graph)
 
         params = flax.core.unfreeze(params)
         params['params']['heatmap'] = output.nodes.squeeze()
@@ -371,6 +380,7 @@ class MisOptimizer(lopt_base.LearnedOptimizer):
             rolling_features=common.vec_rolling_mom(decays).init(params),
             iteration=jnp.asarray(0, dtype=jnp.int32),
             budget=jnp.asarray(num_steps, dtype=jnp.int32),
+            augmented_graph=None  # No augmented graph at initialization
         )
       def update(
           self,  # pytype: disable=signature-mismatch  # overriding-parameter-count-checks
@@ -409,7 +419,7 @@ class MisOptimizer(lopt_base.LearnedOptimizer):
         )
 
         # apply GNN
-        output = update_net.apply(theta, graph)
+        output = update_net.apply(theta['update_params'], graph)
         temp = 0.5*(jax.nn.tanh(output.globals)+1)[0] # temperature between 0 and 1
         new_p = (output.nodes / temp).squeeze()
 
@@ -419,6 +429,7 @@ class MisOptimizer(lopt_base.LearnedOptimizer):
           rolling_features=tree_utils.match_type(next_rolling_features, opt_state.rolling_features),
           iteration=opt_state.iteration + 1,
           budget=opt_state.budget,
+          augmented_graph=graph  # Store the augmented graph
         )
         return new_opt_state
     return _Opt()

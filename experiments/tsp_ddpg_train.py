@@ -16,6 +16,7 @@ import orbax.checkpoint as ocp
 import haiku as hk
 import optax
 import uuid
+import jraph
 # import jmp
 
 from datetime import datetime
@@ -109,7 +110,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_save_path", type=str)
     parser.add_argument("--val_steps", type=int, default=200)
     parser.add_argument("--log_steps", type=int, default=1)
-    parser.add_argument("--mlflow_uri", type=str, default="logs")
+    parser.add_argument("--mlflow_uri", type=str, default="http://127.0.0.1:8080")
     parser.add_argument("--experiment_name", type=str, default="ddpg_tsp")
     parser.add_argument("--disable_tqdm", default=False, action="store_true")
     parser.add_argument("--ood_path", default=None, type=str)
@@ -140,19 +141,30 @@ if __name__ == "__main__":
     val_dataset = load_data(args.val_path, batch_size=args.parallel_tasks_val, subset=args.subset)
     task_family = TspTaskFamily(args.problem_size, args.task_batch_size, args.k, baseline = args.baseline, causal = args.causal, meta_loss_type = args.meta_loss_type, top_k=args.top_k, heatmap_init_strategy=args.heatmap_init_strategy, rollout_actor=args.rollout_actor, two_opt_t_max=args.two_opt_t_max, first_accept=args.first_accept)
 
-    # Initialize DDPG agent instead of ES
-    # We'll create a dummy observation to infer the correct feature sizes
-    # Use the raw dummy_model_state directly, just like in tsp_meta_train.py
+    # Initialize DDPG agent with HeatmapOptimizer as actor
+    # Create dummy observation to infer correct feature sizes
     dummy_observation = task_family.dummy_model_state()
     
-    ddpg_agent = DDPGAgent(
+    # Create HeatmapOptimizer (this is the actor in DDPG)
+    heatmap_optimizer = HeatmapOptimizer(
+        embedding_size=args.embedding_size,
+        num_layers_init=args.num_layers_init,
+        num_layers_update=args.num_layers_update,
+        aggregation=args.aggregation,
         update_strategy=args.update_strategy,
+        normalization=args.normalization,
+        dummy_observation=dummy_observation
+    )
+    
+    # Create DDPG agent (trains the HeatmapOptimizer via critic)
+    ddpg_agent = DDPGAgent(
+        heatmap_optimizer=heatmap_optimizer,  # Actor is HeatmapOptimizer
         embedding_size=args.embedding_size,
         num_layers_init=args.num_layers_init,
         num_layers_update=args.num_layers_update,
         aggregation=args.aggregation,
         normalization=args.normalization,
-        dummy_observation=dummy_observation,  # Use raw dummy observation, just like in tsp_meta_train.py
+        dummy_observation=dummy_observation,
         actor_lr=args.actor_lr,
         critic_lr=args.critic_lr,
         tau=args.tau,
@@ -189,17 +201,6 @@ if __name__ == "__main__":
         ddpg_agent.state = ddpg_agent.init(key)
         print("Initialized DDPG agent from scratch")
 
-    # Create global HeatmapOptimizer (reused across functions) - same pattern as tsp_meta_train.py
-    heatmap_optimizer = HeatmapOptimizer(
-        embedding_size=args.embedding_size,
-        num_layers_init=args.num_layers_init,
-        num_layers_update=args.num_layers_update,
-        aggregation=args.aggregation,
-        update_strategy=args.update_strategy,
-        normalization=args.normalization,
-        dummy_observation=dummy_observation  # Use raw dummy observation, just like in tsp_meta_train.py
-    )
-
     # Keeps a maximum of 3 checkpoints and keeps the best one
     options = ocp.CheckpointManagerOptions(
         max_to_keep=3,
@@ -229,116 +230,132 @@ if __name__ == "__main__":
         train_task_pmap = jax.pmap(train_task_batched, axis_name='data', in_axes=(0, 0, None, None, None), static_broadcasted_argnums=(2,3,4))
     
 
-    @partial(jax.jit, static_argnames=['task_family', 'heatmap_optimizer', 'max_length'])
+    @partial(jax.jit, static_argnames=['task_family', 'max_length', 'heatmap_optimizer'])
     def collect_episodes_batched(task_family,
+                                 heatmap_optimizer,
                                  actor_params,
-                                 problems,         # (E, problem_size, 2) or similar
+                                 problems,         # (E, problem_size, 2)
                                  keys,             # (E,)
-                                 max_length=50,
-                                 heatmap_optimizer=None):
+                                 max_length=50):
         """
         Collect E episodes of length T=max_length in parallel and return a flat batch:
-          states_flat, actions_flat, rewards_flat, next_states_flat, dones_flat
-        where states/next_states are GraphsTuple pytrees with leaves shaped (E*T, ...).
+          states_flat, actions_flat, rewards_flat, next_states_flat, dones_flat, timesteps
+        where states/next_states are GraphsTuple pytrees with leaves shaped for E*T graphs.
         """
-
-        # ---- helpers -----------------------------------------------------------
-
-        def _concat_if_dict(x):
-            """Concatenate dict-of-arrays along -1 in a stable (sorted keys) order."""
-            if isinstance(x, dict):
-                parts = [x[k] for k in sorted(x.keys())]
-                chex.assert_equal_shape_prefix(parts, prefix_len=1)
-                return jnp.concatenate(parts, axis=-1)
-            return x
-
-        def _ensure_array_features(graph: jraph.GraphsTuple) -> jraph.GraphsTuple:
-            """Return a GraphsTuple whose nodes/edges/globals are arrays, not dicts."""
-            return graph._replace(
-                nodes=_concat_if_dict(graph.nodes),
-                edges=_concat_if_dict(graph.edges),
-                globals=_concat_if_dict(graph.globals),
-            )
-
-        def _time_shift_next(tree):
-            """Create s_{t+1} by shifting along time dim: (E,T,...) -> (E,T,...)."""
-            return jax.tree_map(lambda x: jnp.concatenate([x[:, 1:], x[:, -1:]], axis=1), tree)
-
-        def _merge_ET(tree, E, T):
-            """Flatten (E,T,...) -> (E*T,...) for every leaf."""
-            return jax.tree_map(lambda x: x.reshape((E * T, *x.shape[2:])), tree)
-
-        # ---- single-episode collection ----------------------------------------
 
         def collect_single_episode(problem, key):
             # Build optimizer with current actor params
             opt_fn = heatmap_optimizer.opt_fn(actor_params)
 
-            # Task params from coordinates (start node arbitrary constant here)
+            # Task params from coordinates
             task_params = TspTaskParams(coordinates=problem, starting_node=1)
 
             # Run trajectory-producing inference
             traj = train_task_with_trajectory(task_params, key, max_length, opt_fn, task_family)
 
             # Rewards from improvements in best solution (minimization -> negative deltas)
-            best_rewards = traj['best_reward']                         # (T,)
+            best_rewards = traj['best_reward']  # (T,)
             rewards = jnp.zeros(max_length, dtype=jnp.float32)
             rewards = rewards.at[0].set(-best_rewards[0])
             if max_length > 1:
-                improvements = best_rewards[:-1] - best_rewards[1:]    # prev - curr
+                improvements = best_rewards[:-1] - best_rewards[1:]
                 rewards = rewards.at[1:].set(improvements.astype(jnp.float32))
 
-            # States/actions along time
-            states  = traj['state']    # (T, ...) GraphsTuple with dict or arrays in leaves
-            actions = traj['action']   # (T, ...) array (e.g., edge heatmaps)
-
-            # Convert dict features -> arrays per time step
-            # states is (T, ...); vmap over time then add episode axis later
-            states = jax.vmap(_ensure_array_features)(states)  # (T, ...)
+            # States/actions along time (already aligned and augmented by tasks.py)
+            states = traj['state']        # (T,) GraphsTuple
+            next_states = traj['next_state']
+            actions = traj['action']      # (T, n, k) heatmap per edge (scalar per edge)
 
             # Done flags (only last step is terminal)
             dones = jnp.zeros(max_length, dtype=jnp.float32).at[-1].set(1.0)
 
-            return states, actions, rewards, states, dones  # next_states will be time-shifted later
+            return states, actions, rewards, next_states, dones
 
-        # ---- batch episodes with vmap(E) --------------------------------------
+        # Vectorize over E episodes
+        states, actions, rewards, next_states, dones = jax.vmap(collect_single_episode, in_axes=(0, 0))(problems, keys)
 
-        batched_collect = jax.vmap(collect_single_episode, in_axes=(0, 0))
-        states, actions, rewards, next_states, dones = batched_collect(problems, keys)  # (E, T, ...)
+        # Shapes now: states is a pytree with leaves (E, T, ...)
+        # Infer basic sizes
+        E, T = rewards.shape
 
-        # Build proper next_states by shifting time within each episode
-        # First, ensure array features for the batched GraphsTuple (E,T,...)
-        states = jax.tree_map(lambda x: x, states)          # no-op; keeps structure explicit
-        states = states._replace(                           # ensure array features across (E,T,...)
-            nodes=_concat_if_dict(states.nodes),
-            edges=_concat_if_dict(states.edges),
-            globals=_concat_if_dict(states.globals),
-        )
-        next_states = _time_shift_next(states)
+        # Extract sizes from state tensors
+        # Expect nodes: (E, T, num_nodes, node_feat)
+        num_nodes = states.nodes.shape[2]
+        node_feat = states.nodes.shape[3]
+        # Expect edges: (E, T, num_edges, edge_feat)
+        num_edges = states.edges.shape[2]
+        edge_feat = states.edges.shape[3]
 
-        # Sanity: actions must align with edges on leading dims (E,T,...)
-        chex.assert_equal_shape_prefix([states.edges, actions], prefix_len=2)
-        chex.assert_equal_shape_prefix([next_states.edges, actions], prefix_len=2)
-
-        # Flatten (E,T) -> (E*T) per leaf/array
-        E, T = actions.shape[:2]
-        states_flat      = _merge_ET(states, E, T)
-        next_states_flat = _merge_ET(next_states, E, T)
-
-        # Flatten arrays
-        if actions.ndim >= 3:
-            actions_flat = actions.reshape(E * T, *actions.shape[2:])
+        # Globals can be (E,T,feat) or (E,T,1,feat); normalize to (E,T,feat)
+        if states.globals.ndim == 4:
+            glob_feat = states.globals.shape[-1]
+            globals_ETF = states.globals.reshape(E, T, -1, glob_feat)[:, :, 0, :]
         else:
-            actions_flat = actions.reshape(E * T)
+            glob_feat = states.globals.shape[-1]
+            globals_ETF = states.globals
 
-        rewards_flat = jnp.asarray(rewards, dtype=jnp.float32).reshape(E * T)
-        dones_flat   = jnp.asarray(dones,   dtype=jnp.float32).reshape(E * T)
-        
-        return (states_flat, actions_flat, rewards_flat, next_states_flat, dones_flat)
+        if next_states.globals.ndim == 4:
+            next_globals_ETF = next_states.globals.reshape(E, T, -1, glob_feat)[:, :, 0, :]
+        else:
+            next_globals_ETF = next_states.globals
 
-    def validate(dataset, task_family, actor_params, key, aggregate=True):
+        # Flatten nodes, edges, globals across (E,T)
+        nodes_flat = states.nodes.reshape(E * T * num_nodes, node_feat)
+        edges_flat = states.edges.reshape(E * T * num_edges, edge_feat)
+        globals_flat = globals_ETF.reshape(E * T, glob_feat)
+
+        next_nodes_flat = next_states.nodes.reshape(E * T * num_nodes, node_feat)
+        next_edges_flat = next_states.edges.reshape(E * T * num_edges, edge_feat)
+        next_globals_flat = next_globals_ETF.reshape(E * T, glob_feat)
+
+        # Build senders/receivers with per-graph offsets using per-graph topology
+        # states.senders/receivers: (E, T, num_edges)
+        senders_ETe = states.senders.reshape(E * T, num_edges)
+        receivers_ETe = states.receivers.reshape(E * T, num_edges)
+        graph_indices = jnp.repeat(jnp.arange(E * T, dtype=senders_ETe.dtype), num_edges)
+        node_offsets = (graph_indices * jnp.asarray(num_nodes, dtype=senders_ETe.dtype))
+        senders = (senders_ETe.reshape(-1) + node_offsets).astype(senders_ETe.dtype)
+        receivers = (receivers_ETe.reshape(-1) + node_offsets).astype(receivers_ETe.dtype)
+
+        # n_node/n_edge per graph
+        n_node = jnp.full((E * T,), num_nodes)
+        n_edge = jnp.full((E * T,), num_edges)
+
+        states_flat = jraph.GraphsTuple(
+            nodes=nodes_flat,
+            edges=edges_flat,
+            globals=globals_flat,
+            senders=senders,
+            receivers=receivers,
+            n_node=n_node,
+            n_edge=n_edge,
+        )
+
+        next_states_flat = jraph.GraphsTuple(
+            nodes=next_nodes_flat,
+            edges=next_edges_flat,
+            globals=next_globals_flat,
+            senders=senders,
+            receivers=receivers,
+            n_node=n_node,
+            n_edge=n_edge,
+        )
+
+        # Actions: (E, T, n, k) -> per-edge scalar feature: (E*T*num_edges, 1)
+        actions_flat = actions.reshape(E * T * num_edges, 1)
+
+        # Rewards/Dones to shape (E*T, 1)
+        rewards_flat = rewards.reshape(E * T, 1).astype(jnp.float32)
+        dones_flat = dones.reshape(E * T, 1).astype(jnp.float32)
+
+        # Timesteps per graph in batch: [0..T-1] repeated E times
+        timesteps = jnp.tile(jnp.arange(T), E)
+
+        return (states_flat, actions_flat, rewards_flat, next_states_flat, dones_flat, timesteps)
+
+    def validate(dataset, task_family, heatmap_optimizer, actor_params, key, aggregate=True):
         """Validate the DDPG agent on a batch of problems from the validation set."""
-        # Use global HeatmapOptimizer with current actor parameters
+        # Use HeatmapOptimizer with current actor parameters
         opt = heatmap_optimizer.opt_fn(actor_params)
         
         metrics = []
@@ -400,11 +417,12 @@ if __name__ == "__main__":
             if i % args.val_steps == 0:
                 key, subkey = jax.random.split(key)
                 actor_params = ddpg_agent.get_actor_params(ddpg_agent.state)
-                results = validate(val_dataset, task_family, actor_params, subkey)
+                results = validate(val_dataset, task_family, heatmap_optimizer, actor_params, subkey)
                 mlflow.log_metrics(results, step=i)
 
                 # checkpointing
-                mngr.save(i, ddpg_agent.state, metrics=results)
+                # mngr.save(i, ddpg_agent.state, metrics=results)
+                mngr.save(i, hk.data_structures.to_mutable_dict(actor_params), metrics=results)
 
                 # early stopping
                 early_stop_score = results['val_last_best_reward']
@@ -425,7 +443,7 @@ if __name__ == "__main__":
             
             # Collect episodes in parallel and get training batch directly
             batch = collect_episodes_batched(
-                task_family, actor_params, problems, keys, args.max_length, heatmap_optimizer
+                task_family, heatmap_optimizer, actor_params, problems, keys, args.max_length
             )
             
             # Update DDPG agent
@@ -440,7 +458,7 @@ if __name__ == "__main__":
         best_val_parameters = ddpg_agent.get_actor_params(mngr.restore(mngr.best_step()))
         key, subkey = jax.random.split(key)
         
-        results = validate(val_dataset, task_family, best_val_parameters, subkey, aggregate=False)
+        results = validate(val_dataset, task_family, heatmap_optimizer, best_val_parameters, subkey, aggregate=False)
         aggregates = {
                 **{f'val_mean_{key}':jnp.mean(results[key]).item() for key in results}, 
                 **{f'val_last_{key}':results[key][-1].item() for key in results}
@@ -453,5 +471,5 @@ if __name__ == "__main__":
             _, ood_size, _ = ood_dataset.element_spec.shape
             ood_family = TspTaskFamily(ood_size, args.task_batch_size, args.k, baseline = args.baseline, causal = args.causal, meta_loss_type = args.meta_loss_type, top_k=args.top_k, two_opt_t_max=args.two_opt_t_max, first_accept=args.first_accept)
             key, subkey = jax.random.split(key)
-            ood_results = validate(ood_dataset, ood_family, best_val_parameters, subkey, aggregate=True)
+            ood_results = validate(ood_dataset, ood_family, heatmap_optimizer, best_val_parameters, subkey, aggregate=True)
             mlflow.log_metrics({'ood_score': ood_results['val_last_best_reward']}, step=0)

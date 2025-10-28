@@ -342,5 +342,6 @@ class DDPGAgent:
             'actor_loss': actor_loss,
             'q_values': q_values
         }
-        
+       
+        metrics = {k: float(jnp.asarray(jax.device_get(v)).reshape(-1)[0]) for k, v in metrics.items()} 
         return new_state, metrics

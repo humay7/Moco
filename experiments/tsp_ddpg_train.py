@@ -110,7 +110,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_save_path", type=str)
     parser.add_argument("--val_steps", type=int, default=200)
     parser.add_argument("--log_steps", type=int, default=1)
-    parser.add_argument("--mlflow_uri", type=str, default="http://127.0.0.1:8080")
+    parser.add_argument("--mlflow_uri", type=str, default="logs/mlruns")
     parser.add_argument("--experiment_name", type=str, default="ddpg_tsp")
     parser.add_argument("--disable_tqdm", default=False, action="store_true")
     parser.add_argument("--ood_path", default=None, type=str)

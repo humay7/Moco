@@ -300,7 +300,7 @@ class DDPGAgent:
         
         return new_state
     
-    def update(self, state: DDPGState, batch: Any) -> Tuple[DDPGState, Any]:
+    def update(self, state: DDPGState, batch: Any, train_actor: bool = True, train_critic: bool = True) -> Tuple[DDPGState, Any]:
         """Update DDPG agent using separate critic and actor updates"""
         # batch contains: states, actions, rewards, next_states, dones, timesteps
         if len(batch) == 6:
@@ -310,38 +310,82 @@ class DDPGAgent:
             states, actions, rewards, next_states, dones = batch
             timesteps = None
         
-        # Update critic
-        new_critic_state, critic_loss, q_values = self.update_critic(
-            state.actor_state,
-            state.critic_state,
-            states,
-            actions,
-            next_states,
-            rewards,
-            dones,
-            timesteps
-        )
+        # # Update critic
+        # new_critic_state, critic_loss, q_values = self.update_critic(
+        #     state.actor_state,
+        #     state.critic_state,
+        #     states,
+        #     actions,
+        #     next_states,
+        #     rewards,
+        #     dones,
+        #     timesteps
+        # )
         
-        # Update actor
-        new_actor_state, updated_critic_state, actor_loss = self.update_actor(
-            state.actor_state,
-            new_critic_state,
-            states,
-            timesteps
-        )
+        # # Update actor
+        # new_actor_state, updated_critic_state, actor_loss = self.update_actor(
+        #     state.actor_state,
+        #     new_critic_state,
+        #     states,
+        #     timesteps
+        # )
         
-        # Create new state
+        # # Create new state
+        # new_state = state.replace(
+        #     actor_state=new_actor_state,
+        #     critic_state=updated_critic_state,
+        #     step=state.step + 1
+        # )
+        
+        # metrics = {
+        #     'critic_loss': critic_loss,
+        #     'actor_loss': actor_loss,
+        #     'q_values': q_values
+        # }
+        # metrics = {k: float(jnp.asarray(jax.device_get(v)).reshape(-1)[0]) for k, v in metrics.items()} 
+        # return new_state, metrics
+        
+        actor_state = state.actor_state
+        critic_state = state.critic_state
+        critic_loss = jnp.array(0.0)
+        q_values = jnp.array(0.0)
+
+        # 1) Critic update (always uses target actor/critic)
+        if train_critic:
+            critic_state, critic_loss, q_values = self.update_critic(
+                actor_state,
+                critic_state,
+                states,
+                actions,
+                next_states,
+                rewards,
+                dones,
+                timesteps
+            )
+
+        # 2) Actor update (+ Polyak of targets) only if requested
+        actor_loss = jnp.array(0.0)
+        if train_actor:
+            actor_state, critic_state, actor_loss = self.update_actor(
+                actor_state,
+                critic_state,
+                states,
+                timesteps
+            )
+            # NOTE: update_actor already Polyak-updates both targets.
+            # If train_actor=False, we do NOT Polyak targets (matching CleanRL).
+
         new_state = state.replace(
-            actor_state=new_actor_state,
-            critic_state=updated_critic_state,
+            actor_state=actor_state,
+            critic_state=critic_state,
             step=state.step + 1
         )
-        
+
         metrics = {
             'critic_loss': critic_loss,
             'actor_loss': actor_loss,
             'q_values': q_values
         }
-       
-        metrics = {k: float(jnp.asarray(jax.device_get(v)).reshape(-1)[0]) for k, v in metrics.items()} 
+        # make them plain floats for logging
+        metrics = {k: float(jnp.asarray(v).reshape(())) for k, v in metrics.items()}
         return new_state, metrics

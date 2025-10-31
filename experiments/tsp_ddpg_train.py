@@ -77,6 +77,9 @@ if __name__ == "__main__":
     parser.add_argument("--critic_lr", type=float, default=1e-3)
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--policy_frequency", type=int, default=10,
+                    help="update actor every N outer steps (delayed policy updates)")
+
 
     # metaTraining
     parser.add_argument("--parallel_tasks_train", type=int)
@@ -90,7 +93,7 @@ if __name__ == "__main__":
     parser.add_argument("--dont_stack_antithetic", action="store_true") # whether to stack antithetic samples for gradient estimation
     parser.add_argument("--grad_clip", type=float, default=None)
     parser.add_argument("--lr_schedule", type=str, choices=["constant", "cosine"], default="cosine")
-    parser.add_argument("--warmup_steps", type=int, default=50)
+    parser.add_argument("--warmup_steps", type=int, default=200)
     parser.add_argument("--num_devices", type=int, default=None)
     parser.add_argument("--clip_loss_diff", type=float, default=None)
     parser.add_argument("--sigma", type=float, default=0.01)
@@ -193,12 +196,12 @@ if __name__ == "__main__":
         print("Warning: Overwriting args with metadata from checkpoint that affects the optimizer")
         
         # Load the DDPG state
-        ddpg_agent.state = restore_mngr.restore(restore_mngr.best_step())
+        ddpg_state = restore_mngr.restore(restore_mngr.best_step())
         print(f"Loaded DDPG agent from checkpoint {args.checkpoint_folder} step {restore_mngr.best_step()}")
     else:
         # Initialize from scratch
         key = jax.random.PRNGKey(0)
-        ddpg_agent.state = ddpg_agent.init(key)
+        ddpg_state = ddpg_agent.init(key)
         print("Initialized DDPG agent from scratch")
 
     # Keeps a maximum of 3 checkpoints and keeps the best one
@@ -256,7 +259,7 @@ if __name__ == "__main__":
             # Rewards from improvements in best solution (minimization -> negative deltas)
             best_rewards = traj['best_reward']  # (T,)
             rewards = jnp.zeros(max_length, dtype=jnp.float32)
-            rewards = rewards.at[0].set(-best_rewards[0])
+            rewards = rewards.at[0].set(-0.1*best_rewards[0])
             if max_length > 1:
                 improvements = best_rewards[:-1] - best_rewards[1:]
                 rewards = rewards.at[1:].set(improvements.astype(jnp.float32))
@@ -413,10 +416,11 @@ if __name__ == "__main__":
             print(f'Logged slurm_job_id: {slurm_job_id}', flush=True)
 
         for i in tqdm.tqdm(range(args.outer_train_steps), disable=args.disable_tqdm):
+            # get current actor params once per iteration
+            actor_params = ddpg_agent.get_actor_params(ddpg_state)
             # validation
             if i % args.val_steps == 0:
                 key, subkey = jax.random.split(key)
-                actor_params = ddpg_agent.get_actor_params(ddpg_agent.state)
                 results = validate(val_dataset, task_family, heatmap_optimizer, actor_params, subkey)
                 mlflow.log_metrics(results, step=i)
 
@@ -432,7 +436,6 @@ if __name__ == "__main__":
                     break
 
             # DDPG training - collect episodes and update
-            actor_params = ddpg_agent.get_actor_params(ddpg_agent.state)
             
             # Collect episodes in parallel using batched collection
             key, subkey = jax.random.split(key)
@@ -447,7 +450,23 @@ if __name__ == "__main__":
             )
             
             # Update DDPG agent
-            ddpg_agent.state, metrics = ddpg_agent.update(ddpg_agent.state, batch)
+            # ddpg_state, metrics = ddpg_agent.update(ddpg_state, batch)
+            
+            # Delayed policy updates + warmup
+            if i < args.warmup_steps:
+                # critic-only warmup: fit critic, freeze actor
+                train_critic = True
+                train_actor = False
+            else:
+                train_critic = True
+                train_actor = (i % args.policy_frequency) == 0
+
+            ddpg_state, metrics = ddpg_agent.update(
+                ddpg_state,
+                batch,
+                train_actor=train_actor,
+                train_critic=train_critic,
+            )
             
             if i % args.log_steps == 0:
                 # replace '||' with '_' to make it a valid mlflow metric name

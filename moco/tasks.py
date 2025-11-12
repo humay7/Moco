@@ -374,8 +374,8 @@ def train_task(cfg, key, num_steps, optimizer, task_family):
     return results
 
 # @chex.assert_max_traces(n=1)
-@partial(jax.jit, static_argnames=['num_steps', 'optimizer', 'task_family'])
-def train_task_with_trajectory(cfg, key, num_steps, optimizer, task_family):
+@partial(jax.jit, static_argnames=['num_steps', 'optimizer', 'task_family', 'init_noise_sigma'])
+def train_task_with_trajectory(cfg, key, num_steps, optimizer, task_family, init_noise_sigma: float = 0.0):
     """ Train a task for num_steps using the optimizer and return the full trajectory for DDPG.
     Args:
         optimizer_params: parameters of the optimizer
@@ -409,13 +409,29 @@ def train_task_with_trajectory(cfg, key, num_steps, optimizer, task_family):
         pre_update_graph = opt_state.augmented_graph
         pre_update_action = params['params']['heatmap']
 
-        # Update optimizer (which stores the augmented graph for the next state)
-        opt_state = optimizer.update(opt_state, grad, loss, model_state)
+        # Add Gaussian action noise (training-time exploration) to the behavior action.
+        # We inject it into the action actually used to produce the next state.
+        if init_noise_sigma > 0.0:
+            noise_key, key = jax.random.split(key)
+            action_noise = init_noise_sigma * jax.random.normal(noise_key, pre_update_action.shape)
+            # Optional clipping: set bounds here if desired; default is no-op.
+            a_low = -jnp.inf
+            a_high = jnp.inf
+            noisy_action = jnp.clip(pre_update_action + action_noise, a_low, a_high)
+        else:
+            noisy_action = pre_update_action
+
+        # Use the noisy action to compute the next optimizer state by temporarily
+        # replacing the heatmap in the current opt_state.
+        noisy_param_tree = flax.core.unfreeze(opt_state.params)
+        noisy_param_tree['params']['heatmap'] = noisy_action
+        noisy_params = flax.core.freeze(noisy_param_tree)
+        opt_state = optimizer.update(opt_state.replace(params=noisy_params), grad, loss, model_state)
 
         # Build aligned RL tuple (s_t, a_t, r_t, s_{t+1})
         state_graph = pre_update_graph
         next_state_graph = opt_state.augmented_graph
-        action = pre_update_action
+        action = noisy_action
 
         # Return additional information for DDPG
         step_info = {
@@ -439,7 +455,7 @@ def train_task_with_trajectory(cfg, key, num_steps, optimizer, task_family):
     trajectory = run_n_step(opt_state, model_state, rollout_key, num_steps)
 
     # Compute cumulative best rewards
-    best_rewards = jax.lax.associative_scan(jax.numpy.minimum, trajectory['reward'])
-    trajectory['best_reward'] = best_rewards
+    # best_rewards = jax.lax.associative_scan(jax.numpy.minimum, trajectory['reward'])
+    # trajectory['best_reward'] = best_rewards
     
     return trajectory

@@ -17,6 +17,7 @@ import haiku as hk
 import optax
 import uuid
 import jraph
+import flax
 # import jmp
 
 from datetime import datetime
@@ -75,10 +76,11 @@ if __name__ == "__main__":
     # DDPG specific parameters
     parser.add_argument("--actor_lr", type=float, default=1e-4)
     parser.add_argument("--critic_lr", type=float, default=1e-3)
-    parser.add_argument("--tau", type=float, default=0.005)
+    parser.add_argument("--tau", type=float, default=0.001)
     parser.add_argument("--gamma", type=float, default=0.99)
-    parser.add_argument("--policy_frequency", type=int, default=10,
+    parser.add_argument("--policy_frequency", type=int, default=2,
                     help="update actor every N outer steps (delayed policy updates)")
+    parser.add_argument("--exploration_sigma", type=float, default=0.1)
 
 
     # metaTraining
@@ -93,7 +95,7 @@ if __name__ == "__main__":
     parser.add_argument("--dont_stack_antithetic", action="store_true") # whether to stack antithetic samples for gradient estimation
     parser.add_argument("--grad_clip", type=float, default=None)
     parser.add_argument("--lr_schedule", type=str, choices=["constant", "cosine"], default="cosine")
-    parser.add_argument("--warmup_steps", type=int, default=200)
+    parser.add_argument("--warmup_steps", type=int, default=100)
     parser.add_argument("--num_devices", type=int, default=None)
     parser.add_argument("--clip_loss_diff", type=float, default=None)
     parser.add_argument("--sigma", type=float, default=0.01)
@@ -239,30 +241,58 @@ if __name__ == "__main__":
                                  actor_params,
                                  problems,         # (E, problem_size, 2)
                                  keys,             # (E,)
-                                 max_length=50):
+                                 max_length=50,
+                                 init_noise_sigma=args.exploration_sigma):
         """
         Collect E episodes of length T=max_length in parallel and return a flat batch:
           states_flat, actions_flat, rewards_flat, next_states_flat, dones_flat, timesteps
         where states/next_states are GraphsTuple pytrees with leaves shaped for E*T graphs.
         """
-
+        # def add_param_noise(params, key, sigma):
+        #     p = flax.core.unfreeze(params)
+        #     # Only perturb the learnable heatmap tensor
+        #     eps = sigma * jax.random.normal(key, p['params']['heatmap'].shape)
+        #     p['params']['heatmap'] = p['params']['heatmap'] + eps
+        #     return flax.core.freeze(p)
+    
         def collect_single_episode(problem, key):
             # Build optimizer with current actor params
-            opt_fn = heatmap_optimizer.opt_fn(actor_params)
+            # key_noise, key_roll = jax.random.split(key)
+            # noisy_params = add_param_noise(actor_params, key_noise, exploration_sigma)
+            opt_fn = heatmap_optimizer.opt_fn(actor_params)   # use perturbed actor
 
             # Task params from coordinates
             task_params = TspTaskParams(coordinates=problem, starting_node=1)
 
             # Run trajectory-producing inference
-            traj = train_task_with_trajectory(task_params, key, max_length, opt_fn, task_family)
+            traj = train_task_with_trajectory(task_params, key, max_length, opt_fn, task_family, init_noise_sigma)
 
             # Rewards from improvements in best solution (minimization -> negative deltas)
-            best_rewards = traj['best_reward']  # (T,)
+            best_rewards = traj['reward']  # (T,)
+            best = jax.lax.associative_scan(jnp.minimum, best_rewards)  # enforce non-increasing
             rewards = jnp.zeros(max_length, dtype=jnp.float32)
-            rewards = rewards.at[0].set(-0.1*best_rewards[0])
+            # set first reward to the initial best reward
+            rewards = rewards.at[0].set(best[0].astype(jnp.float32))
             if max_length > 1:
-                improvements = best_rewards[:-1] - best_rewards[1:]
-                rewards = rewards.at[1:].set(improvements.astype(jnp.float32))
+                # rewards = rewards.at[1:].set(best[:-1] - best[1:])
+                rewards = rewards.at[1:].set(best[1:] - best[:-1])
+                
+            # Debug: per-episode reward summary
+            # jax.debug.print(
+            #     "collect_single_episode: reward_sum={s}, first={f}, last={l}",
+            #     s=rewards.sum(), f=rewards[0], l=rewards[-1]
+            # )
+            # # Debug: print every reward in the episode
+            # jax.debug.print("collect_single_episode: rewards={r}", r=rewards)
+            # jax.debug.print("collect_single_episode: best_rewards={r}", r=best_rewards)
+            
+            
+            # best_rewards = traj['best_reward']  # (T,)
+            # rewards = jnp.zeros(max_length, dtype=jnp.float32)
+            # rewards = rewards.at[0].set(-0.1*best_rewards[0])
+            # if max_length > 1:
+            #     improvements = best_rewards[:-1] - best_rewards[1:]
+            #     rewards = rewards.at[1:].set(improvements.astype(jnp.float32))
 
             # States/actions along time (already aligned and augmented by tasks.py)
             states = traj['state']        # (T,) GraphsTuple
@@ -276,6 +306,13 @@ if __name__ == "__main__":
 
         # Vectorize over E episodes
         states, actions, rewards, next_states, dones = jax.vmap(collect_single_episode, in_axes=(0, 0))(problems, keys)
+
+        # Debug: batch reward summaries
+        # per_ep_sums = rewards.sum(axis=1)
+        # jax.debug.print("collect_batch: per-episode reward sums={x}", x=per_ep_sums)
+        # jax.debug.print("collect_batch: total batch reward sum={x}", x=per_ep_sums.sum())
+        # # Debug: print every reward for the full batch (E x T)
+        # jax.debug.print("collect_batch: rewards={r}", r=rewards)
 
         # Shapes now: states is a pytree with leaves (E, T, ...)
         # Infer basic sizes

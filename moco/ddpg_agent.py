@@ -52,7 +52,7 @@ class DDPGAgent:
                  dummy_observation=None,
                  actor_lr: float = 1e-4,
                  critic_lr: float = 1e-3,
-                 tau: float = 0.005,
+                 tau: float = 0.001,
                  gamma: float = 0.99):
         
         # Store the HeatmapOptimizer (actor)
@@ -208,7 +208,7 @@ class DDPGAgent:
         # Get next actions from target actor
         # next_states are time-shifted, so they're all from t>=1 and have optimizer features
         # Therefore, always use update_net (pass timesteps=None to avoid init_net)
-        next_actions = self._get_actions(actor_state.target_params, next_states, timesteps=None)
+        next_actions = jax.lax.stop_gradient(self._get_actions(actor_state.target_params, next_states, timesteps=None))
         
         # Concatenate actions to states for critic input
         states_with_actions = self._concatenate_action_to_state(states, actions)
@@ -218,7 +218,7 @@ class DDPGAgent:
         # next_states are time-shifted, so timesteps for next_states are timesteps+1
         # But we pass None since they're all t>=1 and don't need zero-padding
         next_q_values = self._compute_q_values(critic_state.target_params, next_states_with_actions, timesteps=None)
-        target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
+        target_q_values = jax.lax.stop_gradient(rewards + (1 - dones) * self.gamma * next_q_values)
         
         def mse_loss(params):
             # Current states already contain correct t=0 zero features from lopt

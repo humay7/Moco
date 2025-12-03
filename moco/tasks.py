@@ -401,51 +401,55 @@ def train_task_with_trajectory(cfg, key, num_steps, optimizer, task_family, init
         
     def step_fn(state, key):
         opt_state, model_state = state
-        params = optimizer.get_params(opt_state)
-        grad_fun = jax.value_and_grad(loss_fn, has_aux=True)
-        (loss, (model_state, aux, metrics)), grad = grad_fun(params, model_state, key, None)
 
-        # Capture pre-update state and action to ensure t=0 emission uses init graph/heatmap
-        pre_update_graph = opt_state.augmented_graph
+        # 1) Build s_t *before* changing anything
+        state_graph = opt_state.augmented_graph
+
+        # 2) Get current params and the clean (deterministic) action a_t
+        params = optimizer.get_params(opt_state)
         pre_update_action = params['params']['heatmap']
 
-        # Add Gaussian action noise (training-time exploration) to the behavior action.
-        # We inject it into the action actually used to produce the next state.
+        # 3) Exploration: add noise to ACTION (not to the state); clamp/bound it
+        noise_key, key = jax.random.split(key)
         if init_noise_sigma > 0.0:
-            noise_key, key = jax.random.split(key)
             action_noise = init_noise_sigma * jax.random.normal(noise_key, pre_update_action.shape)
-            # Optional clipping: set bounds here if desired; default is no-op.
-            a_low = -jnp.inf
-            a_high = jnp.inf
-            noisy_action = jnp.clip(pre_update_action + action_noise, a_low, a_high)
+            # If your sampler expects [0,1], clamp there; otherwise use tanh-squash
+            noisy_action = pre_update_action + action_noise
         else:
             noisy_action = pre_update_action
 
-        # Use the noisy action to compute the next optimizer state by temporarily
-        # replacing the heatmap in the current opt_state.
-        noisy_param_tree = flax.core.unfreeze(opt_state.params)
-        noisy_param_tree['params']['heatmap'] = noisy_action
-        noisy_params = flax.core.freeze(noisy_param_tree)
-        opt_state = optimizer.update(opt_state.replace(params=noisy_params), grad, loss, model_state)
+        # 4) Build a "behavior params" tree that *only* differs in the heatmap (action)
+        behavior_params_tree = flax.core.unfreeze(params)
+        behavior_params_tree['params']['heatmap'] = noisy_action
+        behavior_params = flax.core.freeze(behavior_params_tree)
 
-        # Build aligned RL tuple (s_t, a_t, r_t, s_{t+1})
-        state_graph = pre_update_graph
-        next_state_graph = opt_state.augmented_graph
-        action = noisy_action
+        # 5) Compute loss/grad *with behavior params* (this makes s_t --a_t'--> s_{t+1} consistent)
 
-        # Return additional information for DDPG
+        (behavior_loss, (model_state_after, aux, metrics)), behavior_grad = \
+            jax.value_and_grad(loss_fn, has_aux=True)(behavior_params, model_state, key, None)
+
+        # 6) One optimizer step using the behavior grad and behavior params
+        #    (We replace the opt_state.params with behavior_params only for this update call)
+        next_opt_state = optimizer.update(opt_state.replace(params=behavior_params),
+                                        behavior_grad, behavior_loss, model_state_after)
+
+        # 7) Build s_{t+1} from the updated optimizer state
+        next_state_graph = next_opt_state.augmented_graph
+
+        # 8) Emit the RL tuple using the behavior action a_t' and consistent next state
         step_info = {
             'state': state_graph,
             'next_state': next_state_graph,
-            'action': action,  # pre-update action a_t
-            'next_action': opt_state.params['params']['heatmap'],  # post-update action a_{t+1}
-            'reward': metrics.best_reward,
+            'action': noisy_action,           # behavior action used to drive transition
+            'action_clean': pre_update_action,# optional: for logging
+            'best_length': metrics.best_reward,
             'metrics': metrics,
             'aux': aux,
-            'opt_state': opt_state
+            'opt_state': next_opt_state
         }
 
-        return (opt_state, model_state), step_info
+        return (next_opt_state, model_state_after), step_info
+
 
     def run_n_step(opt_state, model_state, key, n):
         random_keys = jax.random.split(key, n)

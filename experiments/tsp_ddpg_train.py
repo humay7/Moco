@@ -76,11 +76,11 @@ if __name__ == "__main__":
     # DDPG specific parameters
     parser.add_argument("--actor_lr", type=float, default=1e-4)
     parser.add_argument("--critic_lr", type=float, default=1e-3)
-    parser.add_argument("--tau", type=float, default=0.001)
+    parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--policy_frequency", type=int, default=2,
                     help="update actor every N outer steps (delayed policy updates)")
-    parser.add_argument("--exploration_sigma", type=float, default=0.1)
+    parser.add_argument("--exploration_sigma", type=float, default=0.6)
 
 
     # metaTraining
@@ -268,24 +268,31 @@ if __name__ == "__main__":
             traj = train_task_with_trajectory(task_params, key, max_length, opt_fn, task_family, init_noise_sigma)
 
             # Rewards from improvements in best solution (minimization -> negative deltas)
-            best_rewards = traj['reward']  # (T,)
-            best = jax.lax.associative_scan(jnp.minimum, best_rewards)  # enforce non-increasing
+            best_lengths = jax.lax.associative_scan(jnp.minimum, traj['best_length'])  # non-increasing tour lengths
             rewards = jnp.zeros(max_length, dtype=jnp.float32)
-            # set first reward to the initial best reward
-            rewards = rewards.at[0].set(best[0].astype(jnp.float32))
+            # r[0] = -best_length at first step
+            rewards = rewards.at[0].set((-best_lengths[0]).astype(jnp.float32))
             if max_length > 1:
-                # rewards = rewards.at[1:].set(best[:-1] - best[1:])
-                rewards = rewards.at[1:].set(best[1:] - best[:-1])
-                
+                # Positive improvement only: previous best - current best (>= 0)
+                improvements = (best_lengths[:-1] - best_lengths[1:]).astype(jnp.float32)
+                rewards = rewards.at[1:].set(improvements)
             # Debug: per-episode reward summary
             # jax.debug.print(
             #     "collect_single_episode: reward_sum={s}, first={f}, last={l}",
             #     s=rewards.sum(), f=rewards[0], l=rewards[-1]
             # )
             # # Debug: print every reward in the episode
-            # jax.debug.print("collect_single_episode: rewards={r}", r=rewards)
-            # jax.debug.print("collect_single_episode: best_rewards={r}", r=best_rewards)
+            jax.debug.print("collect_single_episode: traj_best_length={r}", r=traj['best_length'])
             
+            jax.debug.print("collect_single_episode: best_lengths={r}", r=best_lengths)
+            # jax.debug.print("collect_single_episode: rewards={r}", r=rewards)
+            jax.debug.print("collect_single_episode: shaped_rewards={r}", r=rewards)
+            jax.debug.print(
+                "collect_single_episode: rewards min={mn}, max={mx}, sum={sm}",
+                mn=rewards.min(),
+                mx=rewards.max(),
+                sm=rewards.sum(),
+            )            
             
             # best_rewards = traj['best_reward']  # (T,)
             # rewards = jnp.zeros(max_length, dtype=jnp.float32)

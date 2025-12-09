@@ -239,6 +239,7 @@ class DDPGAgent:
 
         # Clip to a reasonable range to avoid exploding regression targets
         # target_q_values = jnp.clip(target_q_values, -5.0, 5.0)
+        target_q_values = jnp.clip(target_q_values, -10.0, 10.0)
 
         target_q_values = jax.lax.stop_gradient(target_q_values)
 

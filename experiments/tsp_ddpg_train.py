@@ -394,6 +394,9 @@ if __name__ == "__main__":
         # Rewards/Dones to shape (E*T, 1)
         rewards_flat = rewards.reshape(E * T, 1).astype(jnp.float32)
         dones_flat = dones.reshape(E * T, 1).astype(jnp.float32)
+        
+        scale = 20.0
+        rewards_flat = rewards_flat / scale
 
         # Timesteps per graph in batch: [0..T-1] repeated E times
         timesteps = jnp.tile(jnp.arange(T), E)
@@ -504,6 +507,7 @@ if __name__ == "__main__":
             else:
                 train_critic = True
                 train_actor = (i % args.policy_frequency) == 0
+                # train_actor = False
 
             ddpg_state, metrics = ddpg_agent.update(
                 ddpg_state,
@@ -514,7 +518,11 @@ if __name__ == "__main__":
             
             if i % args.log_steps == 0:
                 # replace '||' with '_' to make it a valid mlflow metric name
-                metrics = {k.replace("||", "__"): float(v) for k, v in metrics.items() if not 'collect' in k}
+                metrics = {
+                    k.replace("||", "__"): float(v)
+                    for k, v in metrics.items()
+                    if ('collect' not in k) and (train_actor or k != 'actor_loss')
+                }
                 mlflow.log_metrics(metrics, step=i)
 
         # training done, log final validation metrics

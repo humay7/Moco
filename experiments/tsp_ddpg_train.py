@@ -74,8 +74,8 @@ if __name__ == "__main__":
     parser.add_argument("--meta_loss_type", type=str, choices=["best", "log"], default="best")
 
     # DDPG specific parameters
-    parser.add_argument("--actor_lr", type=float, default=1e-4)
-    parser.add_argument("--critic_lr", type=float, default=1e-3)
+    parser.add_argument("--actor_lr", type=float, default=3e-4)
+    parser.add_argument("--critic_lr", type=float, default=1e-4)
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--policy_frequency", type=int, default=2,
@@ -158,7 +158,8 @@ if __name__ == "__main__":
         aggregation=args.aggregation,
         update_strategy=args.update_strategy,
         normalization=args.normalization,
-        dummy_observation=dummy_observation
+        dummy_observation=dummy_observation,
+        normalize_inputs=True
     )
     
     # Create DDPG agent (trains the HeatmapOptimizer via critic)
@@ -270,11 +271,14 @@ if __name__ == "__main__":
             # Rewards from improvements in best solution (minimization -> negative deltas)
             best_lengths = jax.lax.associative_scan(jnp.minimum, traj['best_length'])  # non-increasing tour lengths
             rewards = jnp.zeros(max_length, dtype=jnp.float32)
-            # r[0] = -best_length at first step
-            rewards = rewards.at[0].set((-best_lengths[0]).astype(jnp.float32))
+            # use additive decomposition so that sum_t r_t = -best_lengths[-1]/scale
+            #try scaling by the running mean and std of the rewards
+            scale = 20.0
+            rewards = rewards.at[0].set((-best_lengths[0] / scale).astype(jnp.float32))
             if max_length > 1:
-                # Positive improvement only: previous best - current best (>= 0)
-                improvements = (best_lengths[:-1] - best_lengths[1:]).astype(jnp.float32)
+                prev_best = best_lengths[:-1]
+                curr_best = best_lengths[1:]
+                improvements = ((prev_best - curr_best) / scale).astype(jnp.float32)
                 rewards = rewards.at[1:].set(improvements)
             # Debug: per-episode reward summary
             # jax.debug.print(
@@ -395,8 +399,6 @@ if __name__ == "__main__":
         rewards_flat = rewards.reshape(E * T, 1).astype(jnp.float32)
         dones_flat = dones.reshape(E * T, 1).astype(jnp.float32)
         
-        scale = 20.0
-        rewards_flat = rewards_flat / scale
 
         # Timesteps per graph in batch: [0..T-1] repeated E times
         timesteps = jnp.tile(jnp.arange(T), E)
@@ -491,9 +493,14 @@ if __name__ == "__main__":
             # Sample problems in parallel
             problems = jnp.array([task_family.sample(k).coordinates for k in keys])
             
+            # Exploration noise decay: linearly decay to a floor
+            min_sigma = 0.1
+            frac = max(0.0, min(1.0, i / float(args.outer_train_steps)))
+            curr_sigma = max(min_sigma, args.exploration_sigma * (1.0 - frac))
+
             # Collect episodes in parallel and get training batch directly
             batch = collect_episodes_batched(
-                task_family, heatmap_optimizer, actor_params, problems, keys, args.max_length
+                task_family, heatmap_optimizer, actor_params, problems, keys, args.max_length, curr_sigma
             )
             
             # Update DDPG agent

@@ -178,7 +178,10 @@ class TspTaskFamily(tasks_base.TaskFamily):
                 # graph = knn_graph(problem, k)
                 aux_graph = jraph.GraphsTuple(
                     nodes = {'initial_pos': jnp.zeros((problem_size, 1)).at[starting_node].set(1.)}, # binary feature for the starting node
-                    edges = {'distances': graph.edges.reshape((num_edges, -1)), 'top_k_sols': np.ones((num_edges, top_k), dtype=np.int32)},
+                    edges = {
+                        'distances': ((graph.edges.reshape((num_edges, -1)) - graph.edges.mean()) / (graph.edges.std() + 1e-6)),
+                        'top_k_sols': np.ones((num_edges, top_k), dtype=np.int32)
+                    },
                     globals = {
                         # 'best_cost': np.array([[1.]]), 
                         # 'mean_cost': np.array([[1.]]), 
@@ -287,7 +290,7 @@ class TspTaskFamily(tasks_base.TaskFamily):
                 aux_graph = jraph.GraphsTuple(
                     nodes = {'initial_pos': jnp.zeros((problem_size, 1)).at[starting_node].set(1.)}, 
                     edges = {
-                        'distances': edges.reshape((num_edges, -1)), 
+                        'distances': ((edges.reshape((num_edges, -1)) - edges.mean()) / (edges.std() + 1e-6)), 
                         'top_k_sols': top_k_sols_as_graph.transpose(1,0)
                         },
                     globals = {
@@ -411,12 +414,15 @@ def train_task_with_trajectory(cfg, key, num_steps, optimizer, task_family, init
 
         # 3) Exploration: add noise to ACTION (not to the state); clamp/bound it
         noise_key, key = jax.random.split(key)
-        if init_noise_sigma > 0.0:
-            action_noise = init_noise_sigma * jax.random.normal(noise_key, pre_update_action.shape)
-            # If your sampler expects [0,1], clamp there; otherwise use tanh-squash
-            noisy_action = pre_update_action + action_noise
-        else:
-            noisy_action = pre_update_action
+        pre_noisy = jax.lax.cond(
+            init_noise_sigma > 0.0,
+            lambda _: pre_update_action + init_noise_sigma * jax.random.normal(noise_key, pre_update_action.shape),
+            lambda _: pre_update_action,
+            operand=None
+        )
+        # squash and bound logits to stabilize sampler
+        action_scale = 5.0
+        noisy_action = action_scale * jnp.tanh(pre_noisy)
 
         # 4) Build a "behavior params" tree that *only* differs in the heatmap (action)
         behavior_params_tree = flax.core.unfreeze(params)

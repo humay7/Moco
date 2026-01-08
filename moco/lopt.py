@@ -47,6 +47,7 @@ class GNNLOptState:
   iteration: jnp.ndarray
   budget: jnp.ndarray
   augmented_graph: Any = None  # Store the augmented graph with optimizer features
+  stats: Any = None  # Optional per-step debugging stats
 
 import haiku as hk
 
@@ -172,6 +173,41 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
 
         # Initialize heatmap by running update_net on t=0 augmented graph
         output0 = update_net.apply(theta['update_params'], augmented_graph0)
+        # Build initial stats with same structure as in update()
+        def _stats(x, prefix):
+          return {
+            f'{prefix}_nan': jnp.any(jnp.isnan(x)),
+            f'{prefix}_inf': jnp.any(jnp.isinf(x)),
+            f'{prefix}_min': jnp.nanmin(x),
+            f'{prefix}_max': jnp.nanmax(x),
+            f'{prefix}_mean': jnp.nanmean(x),
+            f'{prefix}_std': jnp.nanstd(x),
+          }
+        init_stats = {}
+        init_stats.update(_stats(stacked_global0, 'pre_apply_globals'))
+        init_stats.update(_stats(stacked_edge0, 'pre_apply_edges'))
+        init_stats.update(_stats(stacked_node0, 'pre_apply_nodes'))
+        init_stats.update(_stats(output0.edges, 'post_apply_output_edges'))
+        if update_strategy == 'temperature' and (output0.globals is not None):
+          temp0 = 0.5 * (jnp.tanh(output0.globals) + 1.0)
+          init_stats.update(_stats(output0.globals, 'post_apply_output_globals'))
+          init_stats.update(_stats(temp0, 'post_apply_temp'))
+        else:
+          # If no globals decoded, still provide consistent keys
+          if hasattr(output0, 'globals') and (output0.globals is not None):
+            init_stats.update(_stats(output0.globals, 'post_apply_output_globals'))
+          else:
+            # create placeholder zeros for globals stats
+            z = jnp.array(0.0)
+            init_stats.update({'post_apply_output_globals_nan': jnp.array(False),
+                               'post_apply_output_globals_inf': jnp.array(False),
+                               'post_apply_output_globals_min': z,
+                               'post_apply_output_globals_max': z,
+                               'post_apply_output_globals_mean': z,
+                               'post_apply_output_globals_std': z})
+          init_stats.update({'post_apply_temp_nan': jnp.array(False), 'post_apply_temp_inf': jnp.array(False),
+                             'post_apply_temp_min': jnp.array(1.0), 'post_apply_temp_max': jnp.array(1.0),
+                             'post_apply_temp_mean': jnp.array(1.0), 'post_apply_temp_std': jnp.array(0.0)})
         params = flax.core.unfreeze(params)
         params['params']['heatmap'] = output0.edges.reshape(n, k)
         params = flax.core.freeze(params)
@@ -182,7 +218,8 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
             rolling_features=common.vec_rolling_mom(decays).init(params),
             iteration=jnp.asarray(0, dtype=jnp.int32),
             budget=jnp.asarray(num_steps, dtype=jnp.int32),
-            augmented_graph=augmented_graph0
+            augmented_graph=augmented_graph0,
+            stats=init_stats
         )
       def update(
           self,  # pytype: disable=signature-mismatch  # overriding-parameter-count-checks
@@ -241,12 +278,42 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
         # apply GNN
         output = update_net.apply(theta['update_params'], graph)
 
-        if update_strategy == 'direct':
-          new_p = output.edges.reshape(n,k)
+        # Collect compact stats for outer logging
+        def _stats(x, prefix):
+          return {
+            f'{prefix}_nan': jnp.any(jnp.isnan(x)),
+            f'{prefix}_inf': jnp.any(jnp.isinf(x)),
+            f'{prefix}_min': jnp.nanmin(x),
+            f'{prefix}_max': jnp.nanmax(x),
+            f'{prefix}_mean': jnp.nanmean(x),
+            f'{prefix}_std': jnp.nanstd(x),
+          }
+        step_stats = {}
+        step_stats.update(_stats(stacked_global, 'pre_apply_globals'))
+        step_stats.update(_stats(stacked_edge, 'pre_apply_edges'))
+        step_stats.update(_stats(stacked_node, 'pre_apply_nodes'))
+        step_stats.update(_stats(output.edges, 'post_apply_output_edges'))
+        step_stats.update(_stats(output.globals, 'post_apply_output_globals'))
 
-        elif update_strategy == 'temperature':
-          temp = 0.5*(jax.nn.tanh(output.globals)+1) # temperature between 0 and 1
-          new_p = (output.edges / temp).reshape(n,k)
+        if update_strategy == 'temperature':
+          # Temperature in (0,1); clamp away from 0/1 to avoid infinities and flat gradients
+          temp_raw = 0.5 * (jax.nn.tanh(output.globals) + 1.0)
+          tmin = jnp.asarray(1e-2, dtype=output.globals.dtype)
+          tmax = jnp.asarray(1.0 - 1e-6, dtype=output.globals.dtype)
+          temp = jnp.clip(temp_raw, tmin, tmax)
+          new_p = (output.edges / temp).reshape(n, k)
+          step_stats.update(_stats(temp, 'post_apply_temp'))
+        else:
+          # direct (no temperature) or other strategies: ensure temp-* keys present for consistent pytree
+          new_p = output.edges.reshape(n, k)
+          step_stats.update({
+            'post_apply_temp_nan': jnp.array(False),
+            'post_apply_temp_inf': jnp.array(False),
+            'post_apply_temp_min': jnp.array(1.0),
+            'post_apply_temp_max': jnp.array(1.0),
+            'post_apply_temp_mean': jnp.array(1.0),
+            'post_apply_temp_std': jnp.array(0.0),
+          })
 
         new_opt_state = GNNLOptState(
           params=jax.tree_util.tree_map(lambda _: new_p, opt_state.params),
@@ -254,7 +321,8 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
           rolling_features=tree_utils.match_type(next_rolling_features, opt_state.rolling_features),
           iteration=opt_state.iteration + 1,
           budget=opt_state.budget,
-          augmented_graph=graph  # Store the augmented graph
+          augmented_graph=graph,  # Store the augmented graph
+          stats=step_stats,
         )
         return new_opt_state
     return _Opt()
@@ -420,7 +488,11 @@ class MisOptimizer(lopt_base.LearnedOptimizer):
 
         # apply GNN
         output = update_net.apply(theta['update_params'], graph)
-        temp = 0.5*(jax.nn.tanh(output.globals)+1)[0] # temperature between 0 and 1
+        # Temperature in (0,1); clamp away from 0 to avoid blow-ups when dividing
+        temp_raw = 0.5 * (jax.nn.tanh(output.globals) + 1.0)
+        tmin = jnp.asarray(1e-2, dtype=output.globals.dtype)
+        tmax = jnp.asarray(1.0 - 1e-6, dtype=output.globals.dtype)
+        temp = jnp.clip(temp_raw, tmin, tmax)[0]
         new_p = (output.nodes / temp).squeeze()
 
         new_opt_state = GNNLOptState(

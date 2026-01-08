@@ -102,7 +102,7 @@ class DDPGAgent:
         )
         self.critic_optimizer = optax.chain(
             optax.clip_by_global_norm(1.0),
-            optax.add_decayed_weights(1e-2),
+            optax.add_decayed_weights(1e-4),
             optax.adam(learning_rate=self.critic_lr),                 # lower than actor_lr; very important
         )
     
@@ -261,6 +261,13 @@ class DDPGAgent:
         (critic_loss, q_values), grads = jax.value_and_grad(mse_loss, has_aux=True)(critic_state.params)
         new_critic_state = critic_state.apply_gradients(grads=grads)
         
+        debug_actions = actions + 0.1 * jax.random.normal(jax.random.PRNGKey(0), actions.shape)
+        s_a = self._concatenate_action_to_state(states, actions)
+        s_a_perturbed = self._concatenate_action_to_state(states, debug_actions)
+        q1 = self._compute_q_values(critic_state.params, s_a, None)
+        q2 = self._compute_q_values(critic_state.params, s_a_perturbed, None)
+        jax.debug.print("Q diff mean={d}", d=jnp.abs(q1 - q2).mean())
+
         return new_critic_state, critic_loss, q_values
     
     @partial(jax.jit, static_argnums=0)
@@ -341,8 +348,8 @@ class DDPGAgent:
 
         # 2) normalize per-batch so variance is ~1
         #    (avoid division by zero for all-zero actions)
-        action_std = jnp.std(action_feat) + 1e-6
-        action_feat = action_feat / action_std
+        # action_std = jnp.std(action_feat) + 1e-6
+        # action_feat = action_feat / action_std
 
         # 3) concat as extra edge feature
         new_edge_features = jnp.concatenate([states.edges, action_feat], axis=-1)

@@ -78,6 +78,10 @@ if __name__ == "__main__":
     parser.add_argument("--critic_lr", type=float, default=1e-4)
     parser.add_argument("--tau", type=float, default=0.005)
     parser.add_argument("--gamma", type=float, default=0.99)
+    # Reward shaping (policy-invariant) controls
+    parser.add_argument("--reward_shaping", type=str, choices=["none", "potential"], default="potential")
+    parser.add_argument("--potential_scale", type=float, default=1.0, help="Scale for Phi(s) in potential shaping")
+    parser.add_argument("--disable_first_step_lb_shift", action="store_true", help="Disable the first-step lower-bound reward shift")
     parser.add_argument("--policy_frequency", type=int, default=2,
                     help="update actor every N outer steps (delayed policy updates)")
     parser.add_argument("--exploration_sigma", type=float, default=0.6)
@@ -99,7 +103,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_devices", type=int, default=None)
     parser.add_argument("--clip_loss_diff", type=float, default=None)
     parser.add_argument("--sigma", type=float, default=0.01)
-
+    parser.add_argument("--action_scale", type=float, default=3.0)
     # meta optimizer
     parser.add_argument("--update_strategy", type=str, choices=["direct", "temperature"], default="temperature")
     parser.add_argument("--aggregation", type=str, choices=["sum", "max"], default="sum")
@@ -159,7 +163,7 @@ if __name__ == "__main__":
         update_strategy=args.update_strategy,
         normalization=args.normalization,
         dummy_observation=dummy_observation,
-        normalize_inputs=True
+        normalize_inputs=False
     )
     
     # Create DDPG agent (trains the HeatmapOptimizer via critic)
@@ -174,7 +178,8 @@ if __name__ == "__main__":
         actor_lr=args.actor_lr,
         critic_lr=args.critic_lr,
         tau=args.tau,
-        gamma=args.gamma
+        gamma=args.gamma,
+        action_scale=args.action_scale
     )
 
     # load from checkpoint if available
@@ -249,12 +254,6 @@ if __name__ == "__main__":
           states_flat, actions_flat, rewards_flat, next_states_flat, dones_flat, timesteps
         where states/next_states are GraphsTuple pytrees with leaves shaped for E*T graphs.
         """
-        # def add_param_noise(params, key, sigma):
-        #     p = flax.core.unfreeze(params)
-        #     # Only perturb the learnable heatmap tensor
-        #     eps = sigma * jax.random.normal(key, p['params']['heatmap'].shape)
-        #     p['params']['heatmap'] = p['params']['heatmap'] + eps
-        #     return flax.core.freeze(p)
     
         def collect_single_episode(problem, key):
             # Build optimizer with current actor params
@@ -271,60 +270,45 @@ if __name__ == "__main__":
             # Rewards from improvements in best solution (minimization -> negative deltas)
             best_lengths = jax.lax.associative_scan(jnp.minimum, traj['best_length'])  # non-increasing tour lengths
             rewards = jnp.zeros(max_length, dtype=jnp.float32)
-            # use additive decomposition so that sum_t r_t = -best_lengths[-1]/scale
-            #try scaling by the running mean and std of the rewards
-            scale = 20.0
-            rewards = rewards.at[0].set((-best_lengths[0] / scale).astype(jnp.float32))
+            # Add an action-independent lower bound to shrink the first-step scale (unless disabled):
+            # For each node, take its nearest neighbor distance and sum across nodes.
+            # This constant lower bound does not change optimal policies.
+            coords = problem.astype(jnp.float32)  # (N, 2)
+            dists = jnp.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=-1)
+            # Mask self-distances with +inf so they don't become minima.
+            N = dists.shape[0]
+            dists = dists.at[jnp.arange(N), jnp.arange(N)].set(jnp.inf)
+            per_node_min = jnp.min(dists, axis=1)
+            lower_bound = jnp.sum(per_node_min)
+            jax.debug.print("lower_bound={lb}", lb=lower_bound)
+            first_step_reward = (-best_lengths[0] + lower_bound).astype(jnp.float32)
+            first_step_reward_no_shift = (-best_lengths[0]).astype(jnp.float32)
+            
+            rewards = rewards.at[0].set(jax.lax.cond(
+                args.disable_first_step_lb_shift,
+                lambda: first_step_reward_no_shift,
+                lambda: first_step_reward
+            ))
             if max_length > 1:
                 prev_best = best_lengths[:-1]
                 curr_best = best_lengths[1:]
-                improvements = ((prev_best - curr_best) / scale).astype(jnp.float32)
+                improvements = jnp.maximum(0.0, (prev_best - curr_best)).astype(jnp.float32)
                 rewards = rewards.at[1:].set(improvements)
-            # Debug: per-episode reward summary
-            # jax.debug.print(
-            #     "collect_single_episode: reward_sum={s}, first={f}, last={l}",
-            #     s=rewards.sum(), f=rewards[0], l=rewards[-1]
-            # )
-            # # Debug: print every reward in the episode
-            jax.debug.print("collect_single_episode: traj_best_length={r}", r=traj['best_length'])
-            
-            jax.debug.print("collect_single_episode: best_lengths={r}", r=best_lengths)
-            # jax.debug.print("collect_single_episode: rewards={r}", r=rewards)
-            jax.debug.print("collect_single_episode: shaped_rewards={r}", r=rewards)
-            jax.debug.print(
-                "collect_single_episode: rewards min={mn}, max={mx}, sum={sm}",
-                mn=rewards.min(),
-                mx=rewards.max(),
-                sm=rewards.sum(),
-            )            
-            
-            # best_rewards = traj['best_reward']  # (T,)
-            # rewards = jnp.zeros(max_length, dtype=jnp.float32)
-            # rewards = rewards.at[0].set(-0.1*best_rewards[0])
-            # if max_length > 1:
-            #     improvements = best_rewards[:-1] - best_rewards[1:]
-            #     rewards = rewards.at[1:].set(improvements.astype(jnp.float32))
 
+        
+           
             # States/actions along time (already aligned and augmented by tasks.py)
             states = traj['state']        # (T,) GraphsTuple
             next_states = traj['next_state']
             actions = traj['action']      # (T, n, k) heatmap per edge (scalar per edge)
+            stats = traj['stats']         # (T, ...) dict of per-step stats from lopt/tasks
 
             # Done flags (only last step is terminal)
             dones = jnp.zeros(max_length, dtype=jnp.float32).at[-1].set(1.0)
 
-            return states, actions, rewards, next_states, dones
+            return states, actions, rewards, next_states, dones, stats
 
-        # Vectorize over E episodes
-        states, actions, rewards, next_states, dones = jax.vmap(collect_single_episode, in_axes=(0, 0))(problems, keys)
-
-        # Debug: batch reward summaries
-        # per_ep_sums = rewards.sum(axis=1)
-        # jax.debug.print("collect_batch: per-episode reward sums={x}", x=per_ep_sums)
-        # jax.debug.print("collect_batch: total batch reward sum={x}", x=per_ep_sums.sum())
-        # # Debug: print every reward for the full batch (E x T)
-        # jax.debug.print("collect_batch: rewards={r}", r=rewards)
-
+       
         # Shapes now: states is a pytree with leaves (E, T, ...)
         # Infer basic sizes
         E, T = rewards.shape
@@ -358,6 +342,9 @@ if __name__ == "__main__":
         next_nodes_flat = next_states.nodes.reshape(E * T * num_nodes, node_feat)
         next_edges_flat = next_states.edges.reshape(E * T * num_edges, edge_feat)
         next_globals_flat = next_globals_ETF.reshape(E * T, glob_feat)
+
+        # Flatten stats dict across (E, T) -> (E*T,)
+        stats_flat = jax.tree_map(lambda a: a.reshape(-1), stats)
 
         # Build senders/receivers with per-graph offsets using per-graph topology
         # states.senders/receivers: (E, T, num_edges)
@@ -403,7 +390,7 @@ if __name__ == "__main__":
         # Timesteps per graph in batch: [0..T-1] repeated E times
         timesteps = jnp.tile(jnp.arange(T), E)
 
-        return (states_flat, actions_flat, rewards_flat, next_states_flat, dones_flat, timesteps)
+        return (states_flat, actions_flat, rewards_flat, next_states_flat, dones_flat, timesteps, stats_flat)
 
     def validate(dataset, task_family, heatmap_optimizer, actor_params, key, aggregate=True):
         """Validate the DDPG agent on a batch of problems from the validation set."""
@@ -471,7 +458,7 @@ if __name__ == "__main__":
             if i % args.val_steps == 0:
                 key, subkey = jax.random.split(key)
                 results = validate(val_dataset, task_family, heatmap_optimizer, actor_params, subkey)
-                mlflow.log_metrics(results, step=i)
+                mlflow_log_metrics_safe(results, step=i)
 
                 # checkpointing
                 # mngr.save(i, ddpg_agent.state, metrics=results)
@@ -493,18 +480,13 @@ if __name__ == "__main__":
             # Sample problems in parallel
             problems = jnp.array([task_family.sample(k).coordinates for k in keys])
             
-            # Exploration noise decay: linearly decay to a floor
-            min_sigma = 0.1
-            frac = max(0.0, min(1.0, i / float(args.outer_train_steps)))
-            curr_sigma = max(min_sigma, args.exploration_sigma * (1.0 - frac))
-
             # Collect episodes in parallel and get training batch directly
             batch = collect_episodes_batched(
-                task_family, heatmap_optimizer, actor_params, problems, keys, args.max_length, curr_sigma
+                task_family, heatmap_optimizer, actor_params, problems, keys, args.max_length, args.exploration_sigma
             )
             
             # Update DDPG agent
-            # ddpg_state, metrics = ddpg_agent.update(ddpg_state, batch)
+            
             
             # Delayed policy updates + warmup
             if i < args.warmup_steps:
@@ -524,13 +506,42 @@ if __name__ == "__main__":
             )
             
             if i % args.log_steps == 0:
+                # Compute and log reward/improvement summaries from collected batch
+                states_flat, actions_flat, rewards_flat, next_states_flat, dones_flat, timesteps, stats_flat = batch
+                r = rewards_flat.reshape(-1)
+                ts = timesteps.reshape(-1)
+                # improvements are rewards at timesteps > 0 (t=0 is initial best length term)
+                improvements = jnp.where(ts > 0, r, 0.0)
+                init_rewards = jnp.where(ts == 0, r, 0.0)
+                impr_count = jnp.maximum(1, (ts > 0).sum())
+                init_count = jnp.maximum(1, (ts == 0).sum())
+                extra_metrics = {
+                    'reward_sum': float(r.sum()),
+                    'reward_mean': float(r.mean()),
+                    'reward_max': float(r.max()),
+                    'improvement_sum': float(improvements.sum()),
+                    'improvement_mean': float(improvements.sum() / impr_count),
+                    'initial_reward_sum': float(init_rewards.sum()),
+                    'initial_reward_mean': float(init_rewards.sum() / init_count),
+                }
+                metrics.update(extra_metrics)
+                # Aggregate optimizer-provided per-step stats (from lopt/tasks) across batch*time
+                def agg_stats_dict(stat_dict, prefix='opt'):
+                    agg = {}
+                    for k, v in stat_dict.items():
+                        vf = jnp.asarray(v, dtype=jnp.float32)
+                        agg[f'{prefix}__{k}__mean'] = float(jnp.nanmean(vf))
+                        agg[f'{prefix}__{k}__max'] = float(jnp.nanmax(vf))
+                        agg[f'{prefix}__{k}__min'] = float(jnp.nanmin(vf))
+                    return agg
+                metrics.update(agg_stats_dict(stats_flat, prefix='opt'))
                 # replace '||' with '_' to make it a valid mlflow metric name
                 metrics = {
                     k.replace("||", "__"): float(v)
                     for k, v in metrics.items()
                     if ('collect' not in k) and (train_actor or k != 'actor_loss')
                 }
-                mlflow.log_metrics(metrics, step=i)
+                mlflow_log_metrics_safe(metrics, step=i)
 
         # training done, log final validation metrics
         best_val_parameters = ddpg_agent.get_actor_params(mngr.restore(mngr.best_step()))
@@ -541,7 +552,7 @@ if __name__ == "__main__":
                 **{f'val_mean_{key}':jnp.mean(results[key]).item() for key in results}, 
                 **{f'val_last_{key}':results[key][-1].item() for key in results}
             }
-        mlflow.log_metrics(aggregates, step=args.outer_train_steps)
+        mlflow_log_metrics_safe(aggregates, step=args.outer_train_steps)
 
         # log ood
         if args.ood_path is not None:
@@ -550,4 +561,4 @@ if __name__ == "__main__":
             ood_family = TspTaskFamily(ood_size, args.task_batch_size, args.k, baseline = args.baseline, causal = args.causal, meta_loss_type = args.meta_loss_type, top_k=args.top_k, two_opt_t_max=args.two_opt_t_max, first_accept=args.first_accept)
             key, subkey = jax.random.split(key)
             ood_results = validate(ood_dataset, ood_family, heatmap_optimizer, best_val_parameters, subkey, aggregate=True)
-            mlflow.log_metrics({'ood_score': ood_results['val_last_best_reward']}, step=0)
+            mlflow_log_metrics_safe({'ood_score': ood_results['val_last_best_reward']}, step=0)

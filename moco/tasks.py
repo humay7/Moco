@@ -178,10 +178,7 @@ class TspTaskFamily(tasks_base.TaskFamily):
                 # graph = knn_graph(problem, k)
                 aux_graph = jraph.GraphsTuple(
                     nodes = {'initial_pos': jnp.zeros((problem_size, 1)).at[starting_node].set(1.)}, # binary feature for the starting node
-                    edges = {
-                        'distances': ((graph.edges.reshape((num_edges, -1)) - graph.edges.mean()) / (graph.edges.std() + 1e-6)),
-                        'top_k_sols': np.ones((num_edges, top_k), dtype=np.int32)
-                    },
+                    edges = {'distances': graph.edges.reshape((num_edges, -1)), 'top_k_sols': np.ones((num_edges, top_k), dtype=np.int32)},
                     globals = {
                         # 'best_cost': np.array([[1.]]), 
                         # 'mean_cost': np.array([[1.]]), 
@@ -290,7 +287,7 @@ class TspTaskFamily(tasks_base.TaskFamily):
                 aux_graph = jraph.GraphsTuple(
                     nodes = {'initial_pos': jnp.zeros((problem_size, 1)).at[starting_node].set(1.)}, 
                     edges = {
-                        'distances': ((edges.reshape((num_edges, -1)) - edges.mean()) / (edges.std() + 1e-6)), 
+                        'distances': edges.reshape((num_edges, -1)), 
                         'top_k_sols': top_k_sols_as_graph.transpose(1,0)
                         },
                     globals = {
@@ -422,7 +419,8 @@ def train_task_with_trajectory(cfg, key, num_steps, optimizer, task_family, init
         )
         # squash and bound logits to stabilize sampler
         action_scale = 5.0
-        noisy_action = action_scale * jnp.tanh(pre_noisy)
+        noisy_action = action_scale * jnp.tanh(pre_noisy / action_scale)  
+        # noisy_action = pre_noisy
 
         # 4) Build a "behavior params" tree that *only* differs in the heatmap (action)
         behavior_params_tree = flax.core.unfreeze(params)
@@ -435,12 +433,34 @@ def train_task_with_trajectory(cfg, key, num_steps, optimizer, task_family, init
             jax.value_and_grad(loss_fn, has_aux=True)(behavior_params, model_state, key, None)
 
         # 6) One optimizer step using the behavior grad and behavior params
-        #    (We replace the opt_state.params with behavior_params only for this update call)
+        #    (replace the opt_state.params with behavior_params only for this update call)
         next_opt_state = optimizer.update(opt_state.replace(params=behavior_params),
                                         behavior_grad, behavior_loss, model_state_after)
 
         # 7) Build s_{t+1} from the updated optimizer state
         next_state_graph = next_opt_state.augmented_graph
+
+        # Compose per-step debug stats (merge optimizer stats with action stats)
+        def _stats(x, prefix):
+            return {
+                f'{prefix}_nan': jnp.any(jnp.isnan(x)),
+                f'{prefix}_inf': jnp.any(jnp.isinf(x)),
+                f'{prefix}_min': jnp.nanmin(x),
+                f'{prefix}_max': jnp.nanmax(x),
+                f'{prefix}_mean': jnp.nanmean(x),
+                f'{prefix}_std': jnp.nanstd(x),
+            }
+        step_stats = {}
+        if next_opt_state.stats is not None:
+            # copy fields from optimizer-produced stats
+            # (dict of jnp arrays is a valid pytree)
+            for k, v in next_opt_state.stats.items():
+                step_stats[k] = v
+        # add action-related stats
+        for k, v in _stats(pre_noisy, 'pre_noisy').items():
+            step_stats[k] = v
+        for k, v in _stats(noisy_action, 'noisy_action').items():
+            step_stats[k] = v
 
         # 8) Emit the RL tuple using the behavior action a_t' and consistent next state
         step_info = {
@@ -451,7 +471,8 @@ def train_task_with_trajectory(cfg, key, num_steps, optimizer, task_family, init
             'best_length': metrics.best_reward,
             'metrics': metrics,
             'aux': aux,
-            'opt_state': next_opt_state
+            'opt_state': next_opt_state,
+            'stats': step_stats
         }
 
         return (next_opt_state, model_state_after), step_info

@@ -267,7 +267,7 @@ if __name__ == "__main__":
             # Run trajectory-producing inference
             traj = train_task_with_trajectory(task_params, key, max_length, opt_fn, task_family, init_noise_sigma)
 
-            # Rewards from improvements in best solution (minimization -> negative deltas)
+            
             best_lengths = jax.lax.associative_scan(jnp.minimum, traj['best_length'])  # non-increasing tour lengths
             rewards = jnp.zeros(max_length, dtype=jnp.float32)
             # Add an action-independent lower bound to shrink the first-step scale (unless disabled):
@@ -275,7 +275,7 @@ if __name__ == "__main__":
             # This constant lower bound does not change optimal policies.
             coords = problem.astype(jnp.float32)  # (N, 2)
             dists = jnp.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=-1)
-            # Mask self-distances with +inf so they don't become minima.
+
             N = dists.shape[0]
             dists = dists.at[jnp.arange(N), jnp.arange(N)].set(jnp.inf)
             per_node_min = jnp.min(dists, axis=1)

@@ -53,7 +53,8 @@ class DDPGAgent:
                  actor_lr: float = 3e-4,
                  critic_lr: float = 1e-4,
                  tau: float = 0.005,
-                 gamma: float = 0.99):
+                 gamma: float = 0.99,
+                 action_scale: float = 3.0):
         
         # Store the HeatmapOptimizer (actor)
         self.heatmap_optimizer = heatmap_optimizer
@@ -68,7 +69,7 @@ class DDPGAgent:
         self.dummy_observation = dummy_observation
         self.aggregation = aggregation
         self.normalization = normalization
-        
+        self.action_scale = action_scale
         # DDPG specific parameters
         self.actor_lr = actor_lr
         self.critic_lr = critic_lr
@@ -103,7 +104,7 @@ class DDPGAgent:
         self.critic_optimizer = optax.chain(
             optax.clip_by_global_norm(1.0),
             optax.add_decayed_weights(1e-4),
-            optax.adam(learning_rate=self.critic_lr),                 # lower than actor_lr; very important
+            optax.adam(learning_rate=self.critic_lr),                 
         )
     
     def init(self, key: PRNGKey) -> DDPGState:
@@ -210,13 +211,10 @@ class DDPGAgent:
                      dones: Any,
                      timesteps: Any = None):
         """Update critic network using target networks.
-        
-        Uses init_net for t=0, update_net for t>0 to get actions.
-        Critic always uses update_net (zero-padded for t=0).
+    
         """
         # Get next actions from target actor
         # next_states are time-shifted, so they're all from t>=1 and have optimizer features
-        # Therefore, always use update_net (pass timesteps=None to avoid init_net)
         next_actions = jax.lax.stop_gradient(self._get_actions(actor_state.target_params, next_states, timesteps=None))
         
         # Concatenate actions to states for critic input
@@ -224,11 +222,7 @@ class DDPGAgent:
         next_states_with_actions = self._concatenate_action_to_state(next_states, next_actions)
         
         # Compute target Q-values using critic update network
-        # next_states are time-shifted, so timesteps for next_states are timesteps+1
-        # But we pass None since they're all t>=1 and don't need zero-padding
-        # next_q_values = self._compute_q_values(critic_state.target_params, next_states_with_actions, timesteps=None)
-        # target_q_values = jax.lax.stop_gradient(rewards + (1 - dones) * self.gamma * next_q_values)
-        
+    
         next_q_values = self._compute_q_values(
             critic_state.target_params,
             next_states_with_actions,
@@ -237,10 +231,7 @@ class DDPGAgent:
 
         target_q_values = rewards + (1.0 - dones) * self.gamma * next_q_values
 
-        # Clip to a reasonable range to avoid exploding regression targets
-        # target_q_values = jnp.clip(target_q_values, -5.0, 5.0)
-        target_q_values = jnp.clip(target_q_values, -10.0, 10.0)
-
+       
         target_q_values = jax.lax.stop_gradient(target_q_values)
 
 
@@ -248,10 +239,11 @@ class DDPGAgent:
         tq_mean = target_q_values.mean()
         tq_min = target_q_values.min()
         tq_max = target_q_values.max()
-        jax.debug.print(
-            "update_critic: target_q_values stats - mean={m}, min={mn}, max={mx}",
-            m=tq_mean, mn=tq_min, mx=tq_max
-        )
+        tq_std = target_q_values.std()
+        # jax.debug.print(
+        #     "update_critic: target_q_values stats - mean={m}, std={sd}, min={mn}, max={mx}",
+        #     m=tq_mean, sd=tq_std, mn=tq_min, mx=tq_max
+        # )
         
         def mse_loss(params):
             # Current states already contain correct t=0 zero features from lopt
@@ -261,14 +253,25 @@ class DDPGAgent:
         (critic_loss, q_values), grads = jax.value_and_grad(mse_loss, has_aux=True)(critic_state.params)
         new_critic_state = critic_state.apply_gradients(grads=grads)
         
-        debug_actions = actions + 0.1 * jax.random.normal(jax.random.PRNGKey(0), actions.shape)
-        s_a = self._concatenate_action_to_state(states, actions)
-        s_a_perturbed = self._concatenate_action_to_state(states, debug_actions)
-        q1 = self._compute_q_values(critic_state.params, s_a, None)
-        q2 = self._compute_q_values(critic_state.params, s_a_perturbed, None)
-        jax.debug.print("Q diff mean={d}", d=jnp.abs(q1 - q2).mean())
+        # Compute TD error magnitudes for logging
+        current_q_values_pred = self._compute_q_values(critic_state.params, states_with_actions, timesteps=None)
+        td_error = current_q_values_pred - target_q_values
+        td_abs = jnp.abs(td_error)
+        td_abs_mean = td_abs.mean()
+        td_abs_max = td_abs.max()
+        
 
-        return new_critic_state, critic_loss, q_values
+        # Return critic stats for logging in the outer loop
+        critic_stats = {
+            'target_q_mean': tq_mean,
+            'target_q_std': tq_std,
+            'target_q_min': tq_min,
+            'target_q_max': tq_max,
+            'td_abs_mean': td_abs_mean,
+            'td_abs_max': td_abs_max,
+        }
+
+        return new_critic_state, critic_loss, q_values, critic_stats
     
     @partial(jax.jit, static_argnums=0)
     def update_actor(self,
@@ -277,9 +280,7 @@ class DDPGAgent:
                     states: Any,
                     timesteps: Any = None):
         """Update actor network using critic evaluation.
-        
-        Uses init_net for t=0, update_net for t>0 to get actions.
-        Critic uses update_net for all timesteps (zero-padded for t=0).
+     
         """
         def actor_loss(params):
             # Get actions using appropriate network (init_net for t=0, update_net for t>0)
@@ -306,12 +307,31 @@ class DDPGAgent:
     def _get_actions(self, actor_params: Any, states: Any, timesteps: Any = None) -> Any:
         """Get actions from HeatmapOptimizer networks.
         
-        Uses init_net for t=0 states (no optimizer features yet),
-        and update_net for t>0 states (with optimizer features).
+       
         """
         # Use update network for all timesteps (t=0 has zero-padded optimizer features)
         output = self.heatmap_optimizer.update_net.apply(actor_params['update_params'], states)
-        return output.edges
+        # If the actor was trained with temperature scaling, mirror it here to avoid
+        # a scale mismatch between behavior and target/policy actions.
+        if getattr(self.heatmap_optimizer, "update_strategy", "direct") == "temperature":
+            # Temperature in (0,1); clamp away from 0/1 to avoid extreme divisions
+            temp_raw = 0.5 * (jax.nn.tanh(output.globals) + 1.0)
+            tmin = jnp.asarray(0.5, dtype=output.globals.dtype)
+            tmax = jnp.asarray(1.0 - 1e-6, dtype=output.globals.dtype)
+            temp = jnp.clip(temp_raw, tmin, tmax)
+            # Repeat per-graph temperature across that graph's edges to match edge logits
+            # Under jit, jnp.repeat needs a static total length; provide it to avoid concretization errors.
+            temp_per_edge = jnp.repeat(
+                temp,
+                states.n_edge,
+                axis=0,
+                total_repeat_length=states.edges.shape[0],
+            )
+            logits = output.edges / temp_per_edge
+        else:
+            logits = output.edges
+        logits = self.action_scale * jnp.tanh(logits / self.action_scale)
+        return logits
     
     def _compute_q_values(self, critic_params: Any, states_with_actions: Any, timesteps: Any = None) -> Any:
         """Compute Q-values using the critic update network.
@@ -329,27 +349,12 @@ class DDPGAgent:
         """
         return self.critic_update_net.apply(critic_params['update_params'], states_with_actions).globals
     
-    # def _concatenate_action_to_state(self, states: Any, actions: Any) -> Any:
-    #     """Concatenate action (heatmap) to edge features of the graph state"""
-        
-    #     # Concatenate action to edge features
-    #     new_edge_features = jnp.concatenate([states.edges, actions], axis=-1)
-        
-    #     # Create new GraphsTuple with updated edge features
-    #     new_state = states._replace(edges=new_edge_features)
-        
-    #     return new_state
     
     def _concatenate_action_to_state(self, states: Any, actions: Any) -> Any:
         """Concatenate *normalized* action (heatmap) to edge features of the graph state."""
 
-        # 1) squash to [-1, 1]
-        action_feat = jnp.tanh(actions)
-
-        # 2) normalize per-batch so variance is ~1
-        #    (avoid division by zero for all-zero actions)
-        # action_std = jnp.std(action_feat) + 1e-6
-        # action_feat = action_feat / action_std
+        # 1) squash 
+        action_feat = jnp.tanh(actions / self.action_scale)
 
         # 3) concat as extra edge feature
         new_edge_features = jnp.concatenate([states.edges, action_feat], axis=-1)
@@ -360,48 +365,16 @@ class DDPGAgent:
     def update(self, state: DDPGState, batch: Any, train_actor: bool = True, train_critic: bool = True) -> Tuple[DDPGState, Any]:
         """Update DDPG agent using separate critic and actor updates"""
         # batch contains: states, actions, rewards, next_states, dones, timesteps
-        if len(batch) == 6:
-            states, actions, rewards, next_states, dones, timesteps = batch
-        else:
-            # Backward compatibility if timesteps not provided
+        # Robustly handle both 5- and 6-tuples without relying on len() equality
+        try:
+            states, actions, rewards, next_states, dones, *rest = batch
+            timesteps = rest[0] if len(rest) > 0 else None
+        except (ValueError, TypeError):
+            # Fallback if batch isn't a standard tuple
             states, actions, rewards, next_states, dones = batch
             timesteps = None
         
-        # # Update critic
-        # new_critic_state, critic_loss, q_values = self.update_critic(
-        #     state.actor_state,
-        #     state.critic_state,
-        #     states,
-        #     actions,
-        #     next_states,
-        #     rewards,
-        #     dones,
-        #     timesteps
-        # )
-        
-        # # Update actor
-        # new_actor_state, updated_critic_state, actor_loss = self.update_actor(
-        #     state.actor_state,
-        #     new_critic_state,
-        #     states,
-        #     timesteps
-        # )
-        
-        # # Create new state
-        # new_state = state.replace(
-        #     actor_state=new_actor_state,
-        #     critic_state=updated_critic_state,
-        #     step=state.step + 1
-        # )
-        
-        # metrics = {
-        #     'critic_loss': critic_loss,
-        #     'actor_loss': actor_loss,
-        #     'q_values': q_values
-        # }
-        # metrics = {k: float(jnp.asarray(jax.device_get(v)).reshape(-1)[0]) for k, v in metrics.items()} 
-        # return new_state, metrics
-        
+    
         actor_state = state.actor_state
         critic_state = state.critic_state
         critic_loss = jnp.array(0.0)
@@ -409,7 +382,7 @@ class DDPGAgent:
 
         # 1) Critic update (always uses target actor/critic)
         if train_critic:
-            critic_state, critic_loss, q_values = self.update_critic(
+            critic_state, critic_loss, q_values, critic_stats = self.update_critic(
                 actor_state,
                 critic_state,
                 states,
@@ -419,6 +392,15 @@ class DDPGAgent:
                 dones,
                 timesteps
             )
+        else:
+            critic_stats = {
+                'target_q_mean': jnp.array(0.0),
+                'target_q_std': jnp.array(0.0),
+                'target_q_min': jnp.array(0.0),
+                'target_q_max': jnp.array(0.0),
+                'td_abs_mean': jnp.array(0.0),
+                'td_abs_max': jnp.array(0.0),
+            }
 
         # 2) Actor update (+ Polyak of targets) only if requested
         actor_loss = jnp.array(0.0)
@@ -430,7 +412,7 @@ class DDPGAgent:
                 timesteps
             )
             # NOTE: update_actor already Polyak-updates both targets.
-            # If train_actor=False, we do NOT Polyak targets (matching CleanRL).
+            # If train_actor=False, do NOT Polyak targets (matching CleanRL).
 
         new_state = state.replace(
             actor_state=actor_state,
@@ -441,7 +423,8 @@ class DDPGAgent:
         metrics = {
             'critic_loss': critic_loss,
             'actor_loss': actor_loss,
-            'q_values': q_values
+            'q_values': q_values,
+            **critic_stats
         }
         # make them plain floats for logging
         metrics = {k: float(jnp.asarray(v).reshape(())) for k, v in metrics.items()}

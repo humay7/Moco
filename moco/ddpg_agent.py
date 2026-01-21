@@ -95,11 +95,10 @@ class DDPGAgent:
         self.critic_update_net = hk.without_apply_rng(hk.transform(critic_update_forward))
         
         # Optimizers
-        # self.actor_optimizer = optax.adam(learning_rate=actor_lr)
-        # self.critic_optimizer = optax.adam(learning_rate=critic_lr)
+    
         self.actor_optimizer = optax.chain(
             optax.clip_by_global_norm(1.0),
-            optax.adam(learning_rate=self.actor_lr),        # keep 3e-4 fine
+            optax.adam(learning_rate=self.actor_lr),        
         )
         self.critic_optimizer = optax.chain(
             optax.clip_by_global_norm(1.0),

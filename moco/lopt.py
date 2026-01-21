@@ -80,7 +80,13 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
         decode_global_dimension = 1,
         normalization=self.normalization
         )
-      return network(graph)
+      out = network(graph)
+      # Normalize edges to prevent saturation (DDPG stability fix)
+      # Force 0-mean, 1-std to keep logits in active range of tanh
+      mu = jnp.mean(out.edges)
+      std = jnp.std(out.edges) + 1e-6
+      norm_edges = (out.edges - mu) / std
+      return out._replace(edges=norm_edges)
     
     self.update_net = hk.without_apply_rng(hk.transform(update_forward))
 
@@ -298,7 +304,7 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
         if update_strategy == 'temperature':
           # Temperature in (0,1); clamp away from 0/1 to avoid infinities and flat gradients
           temp_raw = 0.5 * (jax.nn.tanh(output.globals) + 1.0)
-          tmin = jnp.asarray(1e-2, dtype=output.globals.dtype)
+          tmin = jnp.asarray(0.5, dtype=output.globals.dtype)
           tmax = jnp.asarray(1.0 - 1e-6, dtype=output.globals.dtype)
           temp = jnp.clip(temp_raw, tmin, tmax)
           new_p = (output.edges / temp).reshape(n, k)

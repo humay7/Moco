@@ -308,7 +308,9 @@ if __name__ == "__main__":
 
             return states, actions, rewards, next_states, dones, stats
 
-       
+        # Vectorize over E episodes
+        states, actions, rewards, next_states, dones, stats = jax.vmap(collect_single_episode, in_axes=(0, 0))(problems, keys)
+
         # Shapes now: states is a pytree with leaves (E, T, ...)
         # Infer basic sizes
         E, T = rewards.shape

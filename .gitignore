@@ -1,7 +1,49 @@
-data/*
-.vscode/*
-checkpoints/*
-logs/*
-__pycache__
+# -----------------------------
+# Data / IDE
+# -----------------------------
+data/
+.vscode/
+
+# -----------------------------
+# Checkpoints / logs / outputs
+# -----------------------------
+checkpoints/
+checkpoints*/
+logs/
+results/
+eval_logs/
+logs_err/
+tsp_eval/
+lkh_results/
+
+# MLflow
+mlruns/
+mlflow_track/
+
+# SLURM / job outputs
+*.log
+*.err
+slurm-*.out
+
+# Archives / model files
+*.zip
+*.tar
+*.pth
+*.ckpt
+
+# -----------------------------
+# Python / build artifacts
+# -----------------------------
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.ipynb_checkpoints/
+
+# -----------------------------
+# Keep placeholder files
+# -----------------------------
 !*.gitkeep
-*.egg-info

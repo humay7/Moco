@@ -38,8 +38,8 @@ if __name__ == '__main__':
     parser.add_argument("--k", "-k", help="number of nearest neighbors", type=int, default=None)
     parser.add_argument("--causal", "-c", help="use causal accumulation of rewards for policy gradient calc", action="store_true")
     parser.add_argument("--baseline", "-b", help="specify baseline for policy gradient calc", type=str, default=None, choices=[None, "avg"])
-    parser.add_argument("--mlflow_uri", help="mlflow uri", type=str, default="logs")
-    parser.add_argument("--experiment", help="experiment name", type=str, default="tsp")
+    parser.add_argument("--mlflow_uri", help="mlflow uri", type=str, default="logs/mlruns")
+    parser.add_argument("--experiment", help="experiment name", type=str, default="tsp_ddpg_eval_K")
     parser.add_argument("--num_starting_nodes", "-ns", help="number of starting nodes", type=int, default=1)
     parser.add_argument("--checkpoint_folder", "-cf", help="folder to load checkpoint from", type=str, default=None)
     parser.add_argument("--two_opt_t_max", type=int, default=None)
@@ -71,7 +71,6 @@ if __name__ == '__main__':
             args.checkpoint_folder,
             ocp.PyTreeCheckpointer(),
             options=restore_options)
-        
         metadata = restore_mngr.metadata()
         # overwrite command line arguments with checkpoint metadata
         args.top_k = metadata['top_k']
@@ -81,14 +80,17 @@ if __name__ == '__main__':
         args.causal = metadata['causal']
         args.baseline = metadata['baseline']
 
-        lopts = {
-            "adam": lopt_base.LearnableAdam(),
-            "gnn": HeatmapOptimizer(embedding_size=metadata["embedding_size"], num_layers_init=metadata["num_layers_init"], num_layers_update=metadata["num_layers_update"], aggregation=metadata["aggregation"], update_strategy=metadata["update_strategy"], normalization=metadata["normalization"])
-            }
-        l_optimizer = lopts[metadata['lopt']]
+        #lopts = {
+         #   "adam": lopt_base.LearnableAdam(),
+          #  "gnn": HeatmapOptimizer(embedding_size=metadata["embedding_size"], num_layers_init=metadata["num_layers_init"], num_layers_update=metadata["num_layers_update"], aggregation=metadata["aggregation"], update_strategy=metadata["update_strategy"], normalization=metadata["normalization"])
+           # }
+        #lopt_key = metadata.get("lopt", "gnn")
+        l_optimizer = HeatmapOptimizer(embedding_size=metadata["embedding_size"], num_layers_init=metadata["num_layers_init"], num_layers_update=metadata["num_layers_update"], aggregation=metadata["aggregation"], update_strategy=metadata["update_strategy"], normalization=metadata["normalization"])
+
+        #l_optimizer = lopts[metadata['lopt']]
         optimizer_params = restore_mngr.restore(restore_mngr.best_step())
         optimizer = l_optimizer.opt_fn(optimizer_params, is_training=False)
-        print(f"Running {metadata['lopt']} optimizer from checkpoint {args.checkpoint_folder} step {restore_mngr.best_step()}")
+        print(f"Running gnn optimizer from checkpoint {args.checkpoint_folder} step {restore_mngr.best_step()}")
 
     else:
         optimizer = Adam(learning_rate=args.learning_rate)

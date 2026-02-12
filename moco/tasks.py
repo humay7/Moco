@@ -21,6 +21,7 @@ from learned_optimization.learned_optimizers import common, base as lopt_base
 from moco.environments import CustomTSP, CustomGraphTSP
 from jumanji.environments.routing.tsp.generator import Generator, UniformGenerator
 from moco.data_utils import sample_tsp
+from moco.lopt import HeatmapOptimizer
 from moco.tsp_actors import nearest_neighbor, HeatmapActor, knn_graph, fully_connected_graph, SparseHeatmapActor
 from moco.rl_utils import random_actor, greedy_actor, rollout, random_initial_position, greedy_rollout, pomo_rollout, entmax_actor, entmax_policy_gradient_loss
 from moco.two_opt import two_opt_once, _two_opt_python, batched_two_opt_python, jax_two_opt_cb
@@ -178,12 +179,13 @@ class TspTaskFamily(tasks_base.TaskFamily):
                 # graph = knn_graph(problem, k)
                 aux_graph = jraph.GraphsTuple(
                     nodes = {'initial_pos': jnp.zeros((problem_size, 1)).at[starting_node].set(1.)}, # binary feature for the starting node
-                    edges = {'distances': graph.edges.reshape((num_edges, -1)), 'top_k_sols': np.ones((num_edges, top_k), dtype=np.int32)},
+                    edges = {'distances': graph.edges.reshape((num_edges, -1)), 'top_k_sols': np.zeros((num_edges, top_k), dtype=np.int32)},
                     globals = {
                         # 'best_cost': np.array([[1.]]), 
+                        'best_cost': np.array([[0.]], dtype=np.float32),
                         # 'mean_cost': np.array([[1.]]), 
-                        'gaps': np.ones((1, top_k)), 
-                        'relative_improvement': np.array([[1.]])
+                        'gaps': np.zeros((1, top_k)), 
+                        'relative_improvement': np.array([[0.]])
                         },
                     receivers = graph.receivers,
                     senders = graph.senders,
@@ -283,6 +285,7 @@ class TspTaskFamily(tasks_base.TaskFamily):
                 # compute relative gaps within top_k solutions
                 # TODO: what should happen if the batch size is smaller than top k since initial top k is filled with -inf. currently the relative gaps include -inf in the first step
                 gaps = (top_k_rewards - global_best_reward)/global_best_reward
+                best_cost = jnp.atleast_2d((-global_best_reward).astype(jnp.float32))  # shape (1,1)
 
                 aux_graph = jraph.GraphsTuple(
                     nodes = {'initial_pos': jnp.zeros((problem_size, 1)).at[starting_node].set(1.)}, 
@@ -293,6 +296,7 @@ class TspTaskFamily(tasks_base.TaskFamily):
                     globals = {
                         # 'best_cost': jnp.atleast_2d(global_best_reward*-1), 
                         # 'mean_cost': jnp.atleast_2d(weighted_reward.mean()*-1), 
+                        'best_cost': best_cost,
                         'gaps': jnp.atleast_2d(gaps), 
                         'relative_improvement': jnp.atleast_2d(rel_impr)
                         },
@@ -372,3 +376,149 @@ def train_task(cfg, key, num_steps, optimizer, task_family):
     best_rewards = jax.lax.associative_scan(jax.numpy.minimum, results['best_reward']) # equivalent to np.minimum.accumulate()which is not yet implemented in jax https://github.com/google/jax/issues/11281
     results.best_reward = best_rewards
     return results
+
+# @chex.assert_max_traces(n=1)
+@partial(jax.jit, static_argnames=['num_steps', 'optimizer', 'task_family', 'init_noise_sigma'])
+def train_task_with_trajectory(cfg, key, num_steps, optimizer, task_family, init_noise_sigma: float = 0.0):
+    """ Train a task for num_steps using the optimizer and return the full trajectory for DDPG.
+    Args:
+        optimizer_params: parameters of the optimizer
+        cfg: task configuration
+        key: random key
+        num_steps: number of training steps
+        optimizer: optimizer
+        task_family: task family
+    Returns:
+        trajectory: dict containing states, actions, rewards, and metrics at each step
+    """
+
+    task = task_family.task_fn(cfg)
+    key, params_key, rollout_key = jax.random.split(key, 3)
+    params, model_state = task.init_with_state(params_key)
+
+    opt_state = optimizer.init(params, model_state, num_steps=num_steps)
+
+    def loss_fn(param, model_state, key, data):
+        """Wrapper around loss_with_state_and_aux to return 2 values."""
+        loss, model_state, aux, metrics = task.loss_with_state_and_aux(param, model_state, key, data, with_metrics=True)
+        return loss, (model_state, aux, metrics)
+        
+    def step_fn(state, key):
+        opt_state, model_state = state
+
+        # 1) Build s_t *before* changing anything
+        state_graph = opt_state.augmented_graph
+
+        # 2) Get current params and the clean (deterministic) action a_t
+        params = optimizer.get_params(opt_state)
+        pre_update_action = params['params']['heatmap']
+
+        # 3) Exploration: add noise to ACTION (not to the state); clamp/bound it
+        # noise_key, key = jax.random.split(key)
+        # pre_noisy = jax.lax.cond(
+        #     init_noise_sigma > 0.0,
+        #     lambda _: pre_update_action + init_noise_sigma * jax.random.normal(noise_key, pre_update_action.shape),
+        #     lambda _: pre_update_action,
+        #     operand=None
+        # )
+        # squash and bound logits to stabilize sampler
+        # action_scale = 5.0
+        # noisy_action = pre_update_action
+        # noisy_action = pre_noisy
+        pre_noisy = pre_update_action
+        noisy_action = pre_update_action
+
+        # 4) Build a "behavior params" tree that *only* differs in the heatmap (action)
+        behavior_params_tree = flax.core.unfreeze(params)
+        behavior_params_tree['params']['heatmap'] = noisy_action
+        behavior_params = flax.core.freeze(behavior_params_tree)
+
+        # 5) Compute loss/grad *with behavior params* (this makes s_t --a_t'--> s_{t+1} consistent)
+
+        (behavior_loss, (model_state_after, aux, metrics)), behavior_grad = \
+            jax.value_and_grad(loss_fn, has_aux=True)(behavior_params, model_state, key, None)
+
+        # 6) One optimizer step using the behavior grad and behavior params
+        #    (replace the opt_state.params with behavior_params only for this update call)
+        next_opt_state = optimizer.update(opt_state.replace(params=behavior_params),
+                                        behavior_grad, behavior_loss, model_state_after)
+
+        # 7) Build s_{t+1} from the updated optimizer state
+        next_state_graph = next_opt_state.augmented_graph
+
+        # Compose per-step debug stats (merge optimizer stats with action stats)
+        def _stats(x, prefix):
+            return {
+                f'{prefix}_nan': jnp.any(jnp.isnan(x)),
+                f'{prefix}_inf': jnp.any(jnp.isinf(x)),
+                f'{prefix}_min': jnp.nanmin(x),
+                f'{prefix}_max': jnp.nanmax(x),
+                f'{prefix}_mean': jnp.nanmean(x),
+                f'{prefix}_std': jnp.nanstd(x),
+            }
+        step_stats = {}
+        if next_opt_state.stats is not None:
+            # copy fields from optimizer-produced stats
+            # (dict of jnp arrays is a valid pytree)
+            for k, v in next_opt_state.stats.items():
+                step_stats[k] = v
+        # add action-related stats
+        for k, v in _stats(pre_noisy, 'pre_noisy').items():
+            step_stats[k] = v
+        for k, v in _stats(noisy_action, 'noisy_action').items():
+            step_stats[k] = v
+
+        # 8) Emit the RL tuple using the behavior action a_t' and consistent next state
+        step_info = {
+            'state': state_graph,
+            'next_state': next_state_graph,
+            'action': noisy_action,           # behavior action used to drive transition
+            'action_clean': pre_update_action,# optional: for logging
+            'best_length': metrics.best_reward,
+            'metrics': metrics,
+            'aux': aux,
+            'opt_state': next_opt_state,
+            'stats': step_stats
+        }
+
+        return (next_opt_state, model_state_after), step_info
+
+
+    def run_n_step(opt_state, model_state, key, n):
+        random_keys = jax.random.split(key, n)
+        (opt_state, model_state), trajectory = jax.lax.scan(step_fn, (opt_state, model_state), random_keys)
+        return trajectory
+
+    trajectory = run_n_step(opt_state, model_state, rollout_key, num_steps)
+
+    # Compute cumulative best rewards
+    # best_rewards = jax.lax.associative_scan(jax.numpy.minimum, trajectory['reward'])
+    # trajectory['best_reward'] = best_rewards
+    
+    return trajectory
+
+
+if __name__ == "__main__":
+    from moco.lopt import HeatmapOptimizer
+    # simple test run
+    key = jax.random.PRNGKey(0)
+    task_family = TspTaskFamily(problem_size=10, batch_size=4, k=3, baseline='avg', causal=False, meta_loss_type='best', top_k=4, heatmap_init_strategy='constant', rollout_actor='softmax')
+    cfg = task_family.sample(key)
+    # optimizer = opt_base.Adam(learning_rate=1e-2)
+    # results = train_task(cfg, key, num_steps=10, optimizer=optimizer, task_family=task_family)
+    # print("Results:", results)
+    dummy_observation = task_family.dummy_model_state()
+    heatmap_optimizer = HeatmapOptimizer(
+        embedding_size=32,
+        num_layers_init=2,
+        num_layers_update=2,
+        aggregation="sum",
+        update_strategy="direct",
+        normalization="pre",
+        dummy_observation=dummy_observation,
+        normalize_inputs=False
+    )
+    actor_params = heatmap_optimizer.init(key)
+    optimizer = heatmap_optimizer.opt_fn(actor_params)
+    trajectory = train_task_with_trajectory(cfg, key, num_steps=10, optimizer=optimizer, task_family=task_family, init_noise_sigma=0.1)
+    print("Trajectory:", trajectory)

@@ -75,7 +75,7 @@ if __name__ == "__main__":
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--outer_train_steps", type=int, default=10000)
     parser.add_argument("--trunc_schedule", type=str, choices=["constant", "loguniform", "piecewise_linear"], default="constant") # for full es and pes training
-    parser.add_argument("--min_length", type=int, default=10)
+    #parser.add_argument("--min_length", type=int, default=10)
     parser.add_argument("--piecewise_linear_fraction", type=float, default=0.2, help="fraction of outer_train_steps after which the truncation length is max_length")
     parser.add_argument("--patience", type=int, default=20) # early stopping
     parser.add_argument("--dont_stack_antithetic", action="store_true") # whether to stack antithetic samples for gradient estimation
@@ -101,7 +101,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_save_path", type=str)
     parser.add_argument("--val_steps", type=int, default=200)
     parser.add_argument("--log_steps", type=int, default=1)
-    parser.add_argument("--mlflow_uri", type=str, default="logs")
+    parser.add_argument("--mlflow_uri", type=str, default="logs/mlruns")
     parser.add_argument("--experiment_name", type=str, default="meta_tsp")
     parser.add_argument("--disable_tqdm", default=False, action="store_true")
     parser.add_argument("--ood_path", default=None, type=str)
@@ -121,7 +121,7 @@ if __name__ == "__main__":
     if args.num_devices is None:
         args.num_devices = len(jax.devices())
 
-    assert args.min_length <= args.max_length, "loguniform_trunc_min must be smaller equal than max_length"
+    #assert args.min_length <= args.max_length, "loguniform_trunc_min must be smaller equal than max_length"
     assert args.parallel_tasks_train % args.num_devices == 0, f"parallel_tasks_train must be divisible by num_devices {args.num_devices}, jax_devices: {jax.devices()}"
     assert args.parallel_tasks_val % args.num_devices == 0, f"parallel_tasks_val must be divisible by num_devices {args.num_devices}, jax_devices: {jax.devices()}"
     
@@ -268,7 +268,7 @@ if __name__ == "__main__":
     outer_trainer = gradient_learner.SingleMachineGradientLearner(
         theta_init, gradient_estimators, theta_opt)
 
-    key = jax.random.PRNGKey(0)
+    key = jax.random.PRNGKey(12345)
     key, subkey = jax.random.split(key)
     outer_trainer_state = outer_trainer.init(subkey)
 

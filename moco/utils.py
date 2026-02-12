@@ -6,7 +6,8 @@ import jax.numpy as jnp
 from jax._src.lib import pytree
 import pickle
 from pathlib import Path
-from typing import Union
+from typing import Union, Dict, Any, Mapping
+import math
 
 def save_pytree(data: pytree, path: Union[str, Path], overwrite: bool = False):
     path = Path(path)
@@ -59,6 +60,55 @@ def mlflow_log_dict_of_lists(dict_of_lists):
         for i, val in enumerate(metric_history):
             # print(metric_name, i+1, val)
             mlflow.log_metric(metric_name, val, step=i+1)
+
+def _to_python_float(value: Any) -> float:
+    """Best-effort conversion of scalars/0-d arrays to Python float."""
+    try:
+        return float(value)
+    except Exception:
+        return float(jnp.asarray(value))
+
+def mlflow_log_metrics_safe(metrics: Mapping[str, Any], step: int, flag_suffix: str = "_nonfinite", on_nonfinite: str = "skip") -> None:
+    """
+    Log metrics to MLflow while avoiding NaN/Inf values which break the UI.
+    - Converts values to Python floats when possible.
+    - If a value is non-finite:
+        - on_nonfinite == "skip": drop the metric for this step
+        - on_nonfinite == "zero": log 0.0 instead
+        - on_nonfinite == "clip": clip to [-1e12, 1e12]
+      In all cases, also logs a flag metric '<name><flag_suffix>' = 1.0 to signal the issue.
+      Additionally logs:
+        - '<name>_isnan' = 1.0 if value is NaN
+        - '<name>_isinf' = 1.0 if value is +/-Inf
+        (only when a non-finite value is encountered)
+    """
+    safe: Dict[str, float] = {}
+    flags: Dict[str, float] = {}
+    for name, val in metrics.items():
+        try:
+            fv = _to_python_float(val)
+        except Exception:
+            # Un-loggable type; mark and skip
+            flags[f"{name}{flag_suffix}"] = 1.0
+            continue
+        if math.isfinite(fv):
+            safe[name] = fv
+        else:
+            flags[f"{name}{flag_suffix}"] = 1.0
+            # Type-specific flags for debugging
+            if math.isnan(fv):
+                flags[f"{name}_isnan"] = 1.0
+            if math.isinf(fv):
+                flags[f"{name}_isinf"] = 1.0
+            if on_nonfinite == "zero":
+                safe[name] = 0.0
+            elif on_nonfinite == "clip":
+                lim = 1e12
+                safe[name] = max(-lim, min(lim, fv)) if not math.isnan(fv) else 0.0
+            # else "skip": do not log the offending metric, only the flag
+    # Combine and log
+    if safe or flags:
+        mlflow.log_metrics({**safe, **flags}, step=step)
 
 def jax_has_gpu():
     """Returns True if jax can find a gpu, False otherwise"""

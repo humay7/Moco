@@ -47,3 +47,15 @@ build/
 # Keep placeholder files
 # -----------------------------
 !*.gitkeep
+*_bup.py
+*_backup.py
+*_original.py
+*_old.py
+*_later_version.py
+external/
+*_version_learned_dolphin.py
+*version_learned_dolphin*.py
+
+# ignore shell scripts
+*.sh
+*.save

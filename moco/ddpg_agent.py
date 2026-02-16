@@ -55,7 +55,9 @@ class DDPGAgent:
                  tau: float = 0.005,
                  gamma: float = 0.99,
                  action_scale: float = 3.0,
-                 shift_q_values: bool = True):
+                 shift_q_values: bool = True,
+                 normalize_action_with_softmax: bool = True,
+                 q_value_mode: Optional[str] = None):
         
         # Store the HeatmapOptimizer (actor)
         self.heatmap_optimizer = heatmap_optimizer
@@ -77,17 +79,31 @@ class DDPGAgent:
         self.tau = tau
         self.gamma = gamma
         self.shift_q_values = shift_q_values
+        self.normalize_action_with_softmax = normalize_action_with_softmax
+        if q_value_mode is None:
+            q_value_mode = "shift" if shift_q_values else "model_output"
+        allowed_q_value_modes = {
+            "model_output",
+            "shift",
+            "shift_edges_sigmoid",
+            "shift_edges_softmax",
+        }
+        if q_value_mode not in allowed_q_value_modes:
+            raise ValueError(f"Unknown q_value_mode {q_value_mode}. Expected one of {sorted(allowed_q_value_modes)}")
+        self.q_value_mode = q_value_mode
         
         # Critic update network - same GNN structure but decode_globals=True, decode_edges=False
         # Action gets concatenated to edge features
         def critic_update_forward(graph):
+            decode_edges = self.q_value_mode in ("shift_edges_sigmoid", "shift_edges_softmax")
+            decode_globals = self.q_value_mode in ("model_output", "shift")
             network = GNN(
                 num_layers=self.num_layers_update,
                 embedding_size=self.embedding_size,
                 aggregation=self.aggregation,
                 update_globals=True,
-                decode_globals=True,
-                decode_edges=False,  # No edge output, only global output (Q-value)
+                decode_globals=decode_globals,
+                decode_edges=decode_edges,
                 decode_edge_dimension=1,
                 decode_global_dimension=1,  # Outputs single Q-value
                 normalization=self.normalization
@@ -350,18 +366,45 @@ class DDPGAgent:
             timesteps: Unused (kept for signature compatibility)
         
         Returns:
-            Q-values from the critic network globals (shape: (batch_size, 1))
+            Q-values from the critic network (shape: (batch_size, 1))
         """
         states_with_actions = self._concatenate_action_to_state(states, actions)
-        model_output = self.critic_update_net.apply(critic_params['update_params'], states_with_actions).globals
-        if self.shift_q_values:
-            # Shift Q-values by current best tour length so the critic can represent
-            # the final best solution quality explicitly (policy return is improvements).
+        net_output = self.critic_update_net.apply(critic_params['update_params'], states_with_actions)
+
+        if self.q_value_mode in ("model_output", "shift"):
+            model_output = net_output.globals
+            if self.q_value_mode == "shift":
+                # Shift Q-values by current best tour length so the critic can represent
+                # the final best solution quality explicitly (policy return is improvements).
+                current_best_cost = states.globals[:, 0:1]
+                return current_best_cost - model_output
+            return model_output
+
+        if self.q_value_mode in ("shift_edges_sigmoid", "shift_edges_softmax"):
+            edge_logits = net_output.edges.squeeze(-1)
+            if self.q_value_mode == "shift_edges_sigmoid":
+                edge_weights = jax.nn.sigmoid(edge_logits)
+            else:
+                edge_weights = jraph.segment_softmax(
+                    edge_logits, states.senders, num_segments=states.nodes.shape[0]
+                )
+
+            distances = states.edges[:, 0]
+            edge_values = edge_weights * distances
+            edge_counts = states.n_edge
+            segment_ids = jnp.repeat(
+                jnp.arange(edge_counts.shape[0]),
+                edge_counts,
+                total_repeat_length=edge_values.shape[0],
+            )
+            model_output = jraph.segment_sum(
+                edge_values, segment_ids, num_segments=edge_counts.shape[0]
+            ).reshape(-1, 1)
+
             current_best_cost = states.globals[:, 0:1]
-            q_values = current_best_cost - model_output
-        else:
-            q_values = model_output
-        return q_values
+            return current_best_cost - model_output
+
+        raise ValueError(f"Unhandled q_value_mode {self.q_value_mode}")
 
     
     
@@ -371,8 +414,11 @@ class DDPGAgent:
         # 1) squash 
         # action_feat = jnp.tanh(actions / self.action_scale)
         # TODO: normalize with softmax?
-        action_feat = jraph.segment_softmax(actions.squeeze(-1), states.senders, num_segments=states.nodes.shape[0])
-        action_feat = jnp.expand_dims(action_feat, -1)
+        if self.normalize_action_with_softmax:
+            action_feat = jraph.segment_softmax(actions.squeeze(-1), states.senders, num_segments=states.nodes.shape[0])
+            action_feat = jnp.expand_dims(action_feat, -1)
+        else:
+            action_feat = actions
 
         # 3) concat as extra edge feature
         new_edge_features = jnp.concatenate([states.edges, action_feat], axis=-1)

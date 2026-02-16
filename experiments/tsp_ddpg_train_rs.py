@@ -109,6 +109,14 @@ if __name__ == "__main__":
     parser.add_argument("--no_shift_q_values", dest="shift_q_values", action="store_false",
                         help="Disable shifting Q-values by current best tour length")
     parser.set_defaults(shift_q_values=True)
+    parser.add_argument("--disable_action_softmax", action="store_true",
+                        help="Disable segment_softmax normalization of actions before critic")
+    parser.add_argument("--disable_logit_clipping", action="store_true",
+                        help="Disable tanh logit clipping in HeatmapOptimizer update net")
+    parser.add_argument("--q_value_mode", type=str,
+                        choices=["model_output", "shift", "shift_edges_sigmoid", "shift_edges_softmax"],
+                        default=None,
+                        help="Q-value computation mode for critic")
     # meta optimizer
     parser.add_argument("--update_strategy", type=str, choices=["direct", "temperature"], default="temperature")
     parser.add_argument("--aggregation", type=str, choices=["sum", "max"], default="sum")
@@ -150,6 +158,9 @@ if __name__ == "__main__":
     if args.num_devices is None:
         args.num_devices = len(jax.devices())
 
+    if args.q_value_mode is None:
+        args.q_value_mode = "shift" if args.shift_q_values else "model_output"
+
     # assert args.min_length <= args.max_length, "loguniform_trunc_min must be smaller equal than max_length"
     assert args.parallel_tasks_train % args.num_devices == 0, f"parallel_tasks_train must be divisible by num_devices {args.num_devices}, jax_devices: {jax.devices()}"
     assert args.parallel_tasks_val % args.num_devices == 0, f"parallel_tasks_val must be divisible by num_devices {args.num_devices}, jax_devices: {jax.devices()}"
@@ -187,7 +198,8 @@ if __name__ == "__main__":
         normalization=args.normalization,
         dummy_observation=dummy_observation,
         normalize_inputs=False,
-        action_scale=args.action_scale
+        action_scale=args.action_scale,
+        clip_update_logits=not args.disable_logit_clipping,
     )
 
     # Create DDPG agent (trains the HeatmapOptimizer via critic)
@@ -205,6 +217,8 @@ if __name__ == "__main__":
         gamma=args.gamma,
         action_scale=args.action_scale,
         shift_q_values=args.shift_q_values,
+        normalize_action_with_softmax=not args.disable_action_softmax,
+        q_value_mode=args.q_value_mode,
     )
 
     # load from checkpoint if available

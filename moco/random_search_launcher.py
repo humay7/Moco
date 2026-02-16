@@ -57,6 +57,9 @@ DEFAULT_FIXED_ARGS: Dict[str, Any] = {
     "update_strategy": "temperature",
     "disable_first_step_lb_shift": False,
     "no_shift_q_values": False,
+    "q_value_mode": None,
+    "disable_action_softmax": False,
+    "disable_logit_clipping": False,
 }
 
 
@@ -98,6 +101,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--update_strategy", type=str, default=DEFAULT_FIXED_ARGS["update_strategy"])
     p.add_argument("--disable_first_step_lb_shift", action="store_true", default=DEFAULT_FIXED_ARGS["disable_first_step_lb_shift"])
     p.add_argument("--no_shift_q_values", action="store_true", default=DEFAULT_FIXED_ARGS["no_shift_q_values"])
+    p.add_argument("--q_value_mode", type=str, default=DEFAULT_FIXED_ARGS["q_value_mode"],
+                   choices=["model_output", "shift", "shift_edges_sigmoid", "shift_edges_softmax"],
+                   help="Q-value computation mode for critic")
+    p.add_argument("--disable_action_softmax", action="store_true", default=DEFAULT_FIXED_ARGS["disable_action_softmax"],
+                   help="Disable segment_softmax normalization of actions before critic")
+    p.add_argument("--disable_logit_clipping", action="store_true", default=DEFAULT_FIXED_ARGS["disable_logit_clipping"],
+                   help="Disable tanh logit clipping in HeatmapOptimizer update net")
 
     # search control
     p.add_argument("--n_trials", type=int, default=30, help="How many random trials to run")
@@ -375,6 +385,9 @@ def main():
         "update_strategy": args.update_strategy,
         "disable_first_step_lb_shift": args.disable_first_step_lb_shift,
         "no_shift_q_values": args.no_shift_q_values,
+        "q_value_mode": args.q_value_mode,
+        "disable_action_softmax": args.disable_action_softmax,
+        "disable_logit_clipping": args.disable_logit_clipping,
     })
 
     extra_env = None

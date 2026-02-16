@@ -52,7 +52,7 @@ class GNNLOptState:
 import haiku as hk
 
 class HeatmapOptimizer(lopt_base.LearnedOptimizer):
-  def __init__(self, update_strategy='direct', embedding_size=64, num_layers_init=3, num_layers_update=3, aggregation='max', normalize_inputs=False, compute_summary=True, num_node_features=1, num_edge_features=41, num_global_features=45, normalization="pre", dummy_observation=None, action_scale: float = 10.0):
+  def __init__(self, update_strategy='direct', embedding_size=64, num_layers_init=3, num_layers_update=3, aggregation='max', normalize_inputs=False, compute_summary=True, num_node_features=1, num_edge_features=41, num_global_features=45, normalization="pre", dummy_observation=None, action_scale: float = 10.0, clip_update_logits: bool = True):
     self._compute_summary = compute_summary
     self.embedding_size = embedding_size
     self.num_layers_update = num_layers_update
@@ -63,6 +63,7 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
     self.num_global_features = num_global_features
     self.dummy_observation = dummy_observation
     self.action_scale = action_scale
+    self.clip_update_logits = clip_update_logits
     # self.total_steps = total_steps
     self.aggregation = aggregation
     self.normalization = normalization
@@ -89,8 +90,9 @@ class HeatmapOptimizer(lopt_base.LearnedOptimizer):
       # norm_edges = (out.edges - mu) / std
       # return out._replace(edges=norm_edges)
       # TODO: tanh logit capping?
-      clipped_logits = self.action_scale * jnp.tanh(out.edges / self.action_scale)
-      out = out._replace(edges=clipped_logits)
+      if self.clip_update_logits:
+        clipped_logits = self.action_scale * jnp.tanh(out.edges / self.action_scale)
+        out = out._replace(edges=clipped_logits)
       return out
     
     self.update_net = hk.without_apply_rng(hk.transform(update_forward))

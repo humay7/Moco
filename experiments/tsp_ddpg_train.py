@@ -107,6 +107,10 @@ if __name__ == "__main__":
     parser.add_argument("--no_shift_q_values", dest="shift_q_values", action="store_false",
                         help="Disable shifting Q-values by current best tour length")
     parser.set_defaults(shift_q_values=True)
+    parser.add_argument("--disable_action_softmax", action="store_true",
+                        help="Disable segment_softmax normalization of actions before critic")
+    parser.add_argument("--disable_logit_clipping", action="store_true",
+                        help="Disable tanh logit clipping in HeatmapOptimizer update net")
     # meta optimizer
     parser.add_argument("--update_strategy", type=str, choices=["direct", "temperature"], default="temperature")
     parser.add_argument("--aggregation", type=str, choices=["sum", "max"], default="sum")
@@ -168,7 +172,8 @@ if __name__ == "__main__":
         normalization=args.normalization,
         dummy_observation=dummy_observation,
         normalize_inputs=False,
-        action_scale=args.action_scale
+        action_scale=args.action_scale,
+        clip_update_logits=not args.disable_logit_clipping,
     )
     
     # Create DDPG agent (trains the HeatmapOptimizer via critic)
@@ -186,6 +191,7 @@ if __name__ == "__main__":
         gamma=args.gamma,
         action_scale=args.action_scale,
         shift_q_values=args.shift_q_values,
+        normalize_action_with_softmax=not args.disable_action_softmax,
     )
 
     # load from checkpoint if available
